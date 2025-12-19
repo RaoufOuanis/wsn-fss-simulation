@@ -42,13 +42,83 @@ def _meta_value(meta: pd.DataFrame, key: str) -> Optional[str]:
 
 
 def _resolve_meta_path(excel: Path, raw_path: str) -> Path:
+    def _find_project_root(start: Path) -> Optional[Path]:
+        for parent in [start, *start.parents]:
+            if (parent / "requirements.txt").exists() or (parent / "README.md").exists() or (parent / "wsn").is_dir():
+                return parent
+        return None
+
+    raw_path = str(raw_path).strip()
+    if not raw_path:
+        raise FileNotFoundError("Meta path not found: (empty)")
+
     p = Path(raw_path)
+    attempted: List[Path] = []
+
+    # 1) Exact path as stored in Meta (works for correct absolute paths).
+    attempted.append(p)
     if p.exists():
         return p
+
+    # 2) Interpret relative paths against common bases.
+    if not p.is_absolute():
+        for base in [excel.parent, Path.cwd()]:
+            cand = (base / p)
+            attempted.append(cand)
+            if cand.exists():
+                return cand
+
+    # 3) Same filename next to the Excel (legacy behavior).
     p2 = excel.parent / p.name
+    attempted.append(p2)
     if p2.exists():
         return p2
-    raise FileNotFoundError(f"Meta path not found: {raw_path}")
+
+    # 4) Workspace/project root locations.
+    root = _find_project_root(excel.parent)
+    if root is not None:
+        cand = root / p
+        attempted.append(cand)
+        if cand.exists():
+            return cand
+
+        cand2 = root / p.name
+        attempted.append(cand2)
+        if cand2.exists():
+            return cand2
+
+        # 5) Search under simulations/** by filename (common layout in this repo).
+        simulations_dir = root / "simulations"
+        if simulations_dir.is_dir():
+            matches = list(simulations_dir.rglob(p.name))
+            matches = [m for m in matches if m.is_file()]
+            if matches:
+                # Prefer the match closest to the Excel location; fall back to newest mtime.
+                excel_parent = excel.parent.resolve()
+
+                def _score(match: Path) -> tuple[int, float]:
+                    try:
+                        mp = match.resolve()
+                        common = len(set(excel_parent.parents).intersection(set(mp.parents)))
+                    except Exception:
+                        common = 0
+                    try:
+                        mtime = match.stat().st_mtime
+                    except Exception:
+                        mtime = 0.0
+                    return (common, mtime)
+
+                best = max(matches, key=_score)
+                return best
+
+    tried = "\n".join(f" - {t}" for t in attempted)
+    raise FileNotFoundError(
+        "Meta path not found: "
+        + raw_path
+        + "\nTried:" \
+        + ("\n" + tried if tried else " (no candidates)")
+        + "\nHint: ensure Meta.timeseries_csv points to an existing CSV (absolute path, relative to the Excel, or under simulations/**)."
+    )
 
 
 def _load_summary_csv(excel: Path, meta: pd.DataFrame) -> pd.DataFrame:
@@ -63,6 +133,42 @@ def _load_timeseries_csv(excel: Path, meta: pd.DataFrame) -> pd.DataFrame:
     if not raw:
         raise ValueError("Meta.timeseries_csv manquant: requis pour line")
     return pd.read_csv(_resolve_meta_path(excel, raw))
+
+
+def _resolve_timeseries_metric_column(ts: pd.DataFrame, metric: str) -> tuple[str, str]:
+    """Return (column_to_use, label_metric).
+
+    The CLI metrics are often stored with suffixes in timeseries CSVs, e.g.
+    - throughput -> throughput_cum
+    - pkts_to_sink -> pkts_to_sink_cum / pkts_to_sink_round
+    """
+
+    if metric in ts.columns:
+        return metric, metric
+
+    aliases = {
+        "throughput": "throughput_cum",
+    }
+    aliased = aliases.get(metric)
+    if aliased and aliased in ts.columns:
+        return aliased, metric
+
+    candidates = [
+        f"{metric}_cum",
+        f"{metric}_round",
+        f"{metric}__cum",
+        f"{metric}__round",
+    ]
+    for c in candidates:
+        if c in ts.columns:
+            return c, metric
+
+    cols = list(map(str, ts.columns))
+    preview = ", ".join(cols[:30]) + (" …" if len(cols) > 30 else "")
+    raise ValueError(
+        f"Metric introuvable dans timeseries CSV: {metric}\n"
+        f"Colonnes disponibles: {preview}"
+    )
 
 
 def _pick_scenario_label(excel: Path, meta: pd.DataFrame) -> str:
@@ -133,8 +239,11 @@ def plot_scenario_compare_bar(
     # Sort scenarios by mean for central algo if present; else keep input order
     central = next((a for a in algos if is_central_algo(a)), None)
     if central is not None and (data["algo"] == central).any():
-        pivot_c = data[data["algo"] == central].set_index("scenario")["mean"]
-        scenario_order = [s for s in pivot_c.sort_values(ascending=("lower is better" in direction_phrase(metric))).index.tolist()]
+        # Aggregate in case we have duplicated scenario labels (e.g., same scenario label across files)
+        pivot_c = data[data["algo"] == central].groupby("scenario", dropna=False)["mean"].mean()
+        scenario_order = pivot_c.sort_values(
+            ascending=("lower is better" in direction_phrase(metric))
+        ).index.tolist()
     else:
         scenario_order = list(dict.fromkeys(scenario_labels))
 
@@ -459,13 +568,15 @@ def plot_scenario_compare_line(
 ) -> List[Path]:
     scenario_labels: List[str] = []
     per_scenario_ts: Dict[str, pd.DataFrame] = {}
+    per_scenario_metric_col: Dict[str, str] = {}
+    label_metric = metric
     for excel in excels:
         meta, _stats, _wil = _load_sheets(excel)
         scenario = _pick_scenario_label(excel, meta)
         scenario_labels.append(scenario)
         ts = _load_timeseries_csv(excel, meta)
-        if metric not in ts.columns:
-            raise ValueError(f"Metric introuvable dans timeseries CSV: {metric}")
+        col, label_metric = _resolve_timeseries_metric_column(ts, metric)
+        per_scenario_metric_col[scenario] = col
         per_scenario_ts[scenario] = ts
 
     scenario_order = list(dict.fromkeys(scenario_labels))
@@ -479,14 +590,20 @@ def plot_scenario_compare_line(
         any_data = False
         for i, sc in enumerate(scenario_order):
             ts = per_scenario_ts[sc]
-            sub = ts.loc[ts["algo"].astype(str) == algo, ["round", metric]].copy()
+            metric_col = per_scenario_metric_col[sc]
+            sub = ts.loc[ts["algo"].astype(str) == algo, ["round", metric_col]].copy()
             if sub.empty:
                 continue
             any_data = True
-            agg = sub.groupby("round", dropna=False)[metric].mean(numeric_only=True).reset_index().sort_values("round")
+            agg = (
+                sub.groupby("round", dropna=False)[metric_col]
+                .mean(numeric_only=True)
+                .reset_index()
+                .sort_values("round")
+            )
             ax.plot(
                 agg["round"].to_numpy(dtype=float),
-                agg[metric].to_numpy(dtype=float),
+                agg[metric_col].to_numpy(dtype=float),
                 color=algo_color(algo),
                 linestyle=linestyles[i % len(linestyles)],
                 linewidth=(3.0 if is_central_algo(algo) else 1.8),
@@ -498,13 +615,13 @@ def plot_scenario_compare_line(
             continue
 
         ax.set_xlabel("round")
-        ax.set_ylabel(metric_display_name(metric))
-        ax.set_title(f"Scenario comparison — {metric_display_name(metric)} (line) — {display_algo_name(algo)}")
+        ax.set_ylabel(metric_display_name(label_metric))
+        ax.set_title(f"Scenario comparison — {metric_display_name(label_metric)} (line) — {display_algo_name(algo)}")
         ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0.0)
         ax.text(
             0.99,
             0.99,
-            direction_phrase(metric),
+            direction_phrase(label_metric),
             transform=ax.transAxes,
             ha="right",
             va="top",
@@ -513,7 +630,7 @@ def plot_scenario_compare_line(
         )
         fig.tight_layout()
 
-        out = out_dir / f"scenarios__{_safe_name(metric)}__line__{_safe_name(algo)}.png"
+        out = out_dir / f"scenarios__{_safe_name(label_metric)}__line__{_safe_name(algo)}.png"
         fig.savefig(out, dpi=150)
         plt.close(fig)
         written.append(out)

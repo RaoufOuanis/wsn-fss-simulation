@@ -8,6 +8,7 @@ import time
 import queue
 import threading
 import subprocess
+import difflib
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -16,6 +17,8 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 import pandas as pd
+
+from wsn.plot_style import ALGO_COLOR_MAP
 
 
 WORKDIR_DEFAULT = Path(r"C:\wsn-project")
@@ -84,7 +87,8 @@ def _build_process_args(shell_kind: str, workdir: Path, argv: List[str]) -> List
         # powershell.exe -Command "& { Set-Location 'C:\wsn-project'; & 'python.exe' -u -m ... }"
         ps_cmd = "& { Set-Location " + _ps_quote(str(workdir)) + "; "
         # Use explicit quoting for each argument.
-        ps_cmd += "& " + " ".join(_ps_quote(a) for a in argv) + " }"
+        # Ensure the PowerShell process exits with the child exit code.
+        ps_cmd += "& " + " ".join(_ps_quote(a) for a in argv) + "; exit $LASTEXITCODE }"
         return [
             "powershell.exe",
             "-NoProfile",
@@ -166,6 +170,8 @@ class RunnerApp:
         self.compare_excels: List[str] = []
         self.compare_excels_var = tk.StringVar(value="")
         self.compare_algos_var = tk.StringVar(value="FSS")
+        self.compare_algos_help_var = tk.StringVar(value="")
+        self._compare_algos_available: List[str] = []
 
         # Plot metrics
         # radio: either plot with one selected metric, or plot for ALL metrics found in the Excel.
@@ -204,8 +210,96 @@ class RunnerApp:
 
         self._build_ui()
         self._refresh_dynamic_lists()
+        self._refresh_compare_algos_help()
         self._log_queue.put(f"[time] {_system_time_str()} - Application lancée.\n")
         self._tick_ui()
+
+    @staticmethod
+    def _split_csv_names(s: str) -> List[str]:
+        parts = [p.strip() for p in str(s).split(",")]
+        return [p for p in parts if p]
+
+    @staticmethod
+    def _format_short_list(items: List[str], max_items: int = 14) -> str:
+        items = [str(x) for x in items if str(x).strip()]
+        if len(items) <= max_items:
+            return ", ".join(items)
+        shown = items[:max_items]
+        return ", ".join(shown) + f" … (+{len(items) - max_items})"
+
+    def _refresh_compare_algos_help(self) -> None:
+        # Prefer algos detected from selected Excel files; fallback to known repo keys.
+        base = sorted(ALGO_COLOR_MAP.keys(), key=lambda x: (x != "FSS", x.lower()))
+
+        if self._compare_algos_available:
+            disp = self._format_short_list(self._compare_algos_available)
+            self.compare_algos_help_var.set(f"Disponibles (dans Excel sélectionnés): {disp}  |  Saisir séparés par virgules")
+        else:
+            disp = self._format_short_list(base)
+            self.compare_algos_help_var.set(f"Noms courants: {disp}  |  Saisir séparés par virgules")
+
+    def _detect_algos_from_excels(self, excels: List[str]) -> List[str]:
+        found: set[str] = set()
+        for f in excels:
+            try:
+                df = pd.read_excel(f, sheet_name="SummaryStats")
+                if "algo" not in df.columns:
+                    continue
+                for a in df["algo"].dropna().astype(str).tolist():
+                    a = a.strip()
+                    if a:
+                        found.add(a)
+            except Exception:
+                continue
+
+        # Stable ordering: prefer known algos first, then others alpha.
+        known = set(ALGO_COLOR_MAP.keys())
+        known_part = sorted([a for a in found if a in known], key=lambda x: (x != "FSS", x.lower()))
+        other_part = sorted([a for a in found if a not in known], key=lambda x: x.lower())
+        return known_part + other_part
+
+    def _validate_compare_algos_input(self, raw: str) -> str:
+        """Validate and return a normalized comma-separated algos string."""
+
+        parsed = self._split_csv_names(raw)
+        if not parsed:
+            raise ValueError("Liste d'algorithmes vide")
+
+        # Deduplicate while preserving order (common user mistake: typing FSS twice)
+        seen: set[str] = set()
+        algos: List[str] = []
+        for a in parsed:
+            if a not in seen:
+                algos.append(a)
+                seen.add(a)
+
+        allowed = set(self._compare_algos_available) if self._compare_algos_available else set(ALGO_COLOR_MAP.keys())
+        unknown = [a for a in algos if a not in allowed]
+        if unknown:
+            # Suggestions: closest matches among allowed.
+            suggestions: List[str] = []
+            allowed_list = sorted(allowed, key=lambda x: x.lower())
+            for u in unknown:
+                sugg = difflib.get_close_matches(u, allowed_list, n=3, cutoff=0.55)
+                if sugg:
+                    suggestions.append(f"{u} → {', '.join(sugg)}")
+                else:
+                    suggestions.append(f"{u} → (aucune suggestion)")
+
+            avail_text = self._format_short_list(sorted(allowed, key=lambda x: (x != "FSS", x.lower())))
+            msg = (
+                "Algorithme(s) inconnu(s) dans 'Algorithmes (scénarios)':\n"
+                + " - "
+                + "\n - ".join(unknown)
+                + "\n\nSuggestions:\n - "
+                + "\n - ".join(suggestions)
+                + "\n\nDisponibles:\n"
+                + avail_text
+            )
+            raise ValueError(msg)
+
+        # Preserve user order, but normalize spacing.
+        return ",".join(algos)
 
     def _build_ui(self) -> None:
         top = ttk.Frame(self.root, padding=10)
@@ -382,6 +476,14 @@ class RunnerApp:
         ttk.Label(self.plots_frame, text="Algorithmes (scénarios):").grid(row=5, column=0, sticky="w", pady=(8, 0))
         ttk.Entry(self.plots_frame, textvariable=self.compare_algos_var, width=60).grid(row=5, column=1, columnspan=3, sticky="we", pady=(8, 0))
 
+        ttk.Label(self.plots_frame, textvariable=self.compare_algos_help_var).grid(
+            row=6,
+            column=1,
+            columnspan=3,
+            sticky="w",
+            pady=(2, 0),
+        )
+
         self.plots_frame.columnconfigure(1, weight=1)
 
     def _choose_excels_multi(self) -> None:
@@ -395,6 +497,9 @@ class RunnerApp:
 
         # Keep stable order as selected by user
         self.compare_excels = [str(f) for f in files]
+
+        self._compare_algos_available = self._detect_algos_from_excels(self.compare_excels)
+        self._refresh_compare_algos_help()
 
         # Display summary (avoid super long strings)
         names = [Path(f).name for f in self.compare_excels]
@@ -495,6 +600,34 @@ class RunnerApp:
                 out.append(m)
                 seen.add(m)
         return out
+
+    def _common_metrics_for_excels(self, excels: List[str]) -> List[str]:
+        """Return metrics common to all provided Excel reports.
+
+        Uses the metric list inferred from the SummaryStats sheet ("*_mean" columns).
+        Order is preserved from the first Excel file.
+        """
+
+        if not excels:
+            return []
+
+        per_file: List[List[str]] = []
+        for f in excels:
+            try:
+                ms = self._extract_metrics_from_excel(Path(f))
+            except Exception:
+                ms = []
+            per_file.append(ms)
+
+        if not per_file or not per_file[0]:
+            return []
+
+        common = set(per_file[0])
+        for ms in per_file[1:]:
+            common &= set(ms)
+
+        # Preserve order from the first excel.
+        return [m for m in per_file[0] if m in common]
 
     def _refresh_metric_dropdown(self) -> None:
         # Prefer metrics inferred from a selected Excel report (most accurate)
@@ -980,54 +1113,86 @@ class RunnerApp:
                 return
 
             mode = (self.metric_mode_var.get() or "one").strip()
-            metric = self.metric_var.get().strip() or "throughput"
-            if mode == "select":
-                selected = [m for m, v in self._metric_select_vars.items() if bool(v.get())]
-                if selected:
-                    metric = str(selected[0])
-                    if len(selected) > 1:
-                        self._log_queue.put(f"[runner] Note: mode 'Sélection' -> utilisation de la 1ère métrique: {metric}\n")
-            elif mode == "all":
-                # Scenario comparison is defined "on the basis of one metric".
-                self._log_queue.put("[runner] Note: mode 'Toutes' -> utilisation de la métrique courante pour comparer les scénarios.\n")
 
-            algos = self.compare_algos_var.get().strip() or "FSS"
+            # Metrics to run for scenario comparison
+            metrics_to_run: List[str] = []
+            if mode == "one":
+                metrics_to_run = [self.metric_var.get().strip() or "throughput"]
+            elif mode == "select":
+                # Keep UI order from _metric_values
+                metrics_to_run = [m for m in self._metric_values if bool(self._metric_select_vars.get(str(m), tk.BooleanVar(value=False)).get())]
+                if not metrics_to_run:
+                    raise ValueError("Sélection métriques: cochez au moins une métrique")
+            else:
+                # all
+                metrics_to_run = self._common_metrics_for_excels(self.compare_excels)
+                if not metrics_to_run:
+                    # Fallback to current known list (may still fail later if missing in some Excel)
+                    metrics_to_run = list(self._metric_values) or [self.metric_var.get().strip() or "throughput"]
 
-            self._log_queue.put(f"[runner] Compare scénarios: metric={metric}, algos={algos}, plots={','.join(plot_types)}\n")
+            # In 'select'/'all' modes, only keep metrics present in all selected excels.
+            common_metrics = set(self._common_metrics_for_excels(self.compare_excels))
+            if common_metrics:
+                missing = [m for m in metrics_to_run if m not in common_metrics]
+                if missing:
+                    miss_txt = ", ".join(missing)
+                    common_txt = self._format_short_list([m for m in self._common_metrics_for_excels(self.compare_excels)])
+                    raise ValueError(
+                        "Certaines métriques ne sont pas présentes dans tous les Excel sélectionnés:\n"
+                        f"- Manquantes: {miss_txt}\n\n"
+                        f"Métriques communes disponibles:\n{common_txt}"
+                    )
+                # Filter any non-common metrics (defensive)
+                metrics_to_run = [m for m in metrics_to_run if m in common_metrics]
 
-            # Simple progress: one command
+            algos_raw = self.compare_algos_var.get().strip() or "FSS"
+            algos = self._validate_compare_algos_input(algos_raw)
+
+            metrics_disp = self._format_short_list(metrics_to_run, max_items=10)
+            self._log_queue.put(
+                f"[runner] Compare scénarios: metrics={metrics_disp}, algos={algos}, plots={','.join(plot_types)}\n"
+            )
+
+            # Progress: one command per metric
             with self._progress_lock:
-                self._progress_total_units = 1
+                self._progress_total_units = max(1, len(metrics_to_run))
                 self._progress_done_units = 0
                 self._progress_t0 = time.time()
             self._compute_and_push_progress()
 
             self._log_queue.put(f"[time] {_system_time_str()} - Début étape: Graphiques (comparaison scénarios).\n")
-            argv = [
-                sys.executable,
-                "-u",
-                "-m",
-                "scripts.plot_multi_excel",
-                "--excels",
-                *self.compare_excels,
-                "--out_dir",
-                str(Path(self.workdir_var.get())),
-                "--metric",
-                metric,
-                "--algos",
-                algos,
-                "--plots",
-                ",".join(plot_types),
-            ]
-            rc = self._run_cmd_with_progress(argv, count_run_lines=False)
-            if rc != 0:
-                raise RuntimeError("Génération graphique scénarios échouée")
 
-            with self._progress_lock:
-                self._progress_done_units = 1
-            self._compute_and_push_progress()
+            out_dir = str(Path(self.workdir_var.get()))
+            for metric in metrics_to_run:
+                if self._stop_event.is_set():
+                    raise RuntimeError("Arrêt demandé")
 
-            self._log_queue.put("[runner] Graphique comparaison scénarios OK.\n")
+                self._log_queue.put(f"[runner] -> métrique: {metric}\n")
+                argv = [
+                    sys.executable,
+                    "-u",
+                    "-m",
+                    "scripts.plot_multi_excel",
+                    "--excels",
+                    *self.compare_excels,
+                    "--out_dir",
+                    out_dir,
+                    "--metric",
+                    str(metric),
+                    "--algos",
+                    algos,
+                    "--plots",
+                    ",".join(plot_types),
+                ]
+                rc = self._run_cmd_with_progress(argv, count_run_lines=False)
+                if rc != 0:
+                    raise RuntimeError(f"Génération graphique scénarios échouée (metric={metric})")
+
+                with self._progress_lock:
+                    self._progress_done_units += 1
+                self._compute_and_push_progress()
+
+            self._log_queue.put("[runner] Graphiques comparaison scénarios OK.\n")
             self._log_queue.put(f"[time] {_system_time_str()} - Fin étape: Graphiques (comparaison scénarios).\n")
             self.root.after(0, self._refresh_dynamic_lists)
             return

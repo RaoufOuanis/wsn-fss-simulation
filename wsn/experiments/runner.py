@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Dict, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from time import perf_counter
 
 import numpy as np
@@ -30,6 +30,9 @@ from ..algorithms.protocols import (
     run_heed_wsn, HEEDParams,
     run_sep_wsn, SEPParams, SEPState,
     run_greedy_wsn, GreedyParams,
+)
+from ..algorithms.eem_leach_abc_wsn import (
+    run_eem_leach_abc_wsn, EEMParams, EEMState,
 )
 
 
@@ -66,6 +69,16 @@ def _make_fss_params_for_algo(algo_name: str, seed: int) -> FSSParams:
 
     if algo_name == "FSS":
         params.use_phase2 = True
+    elif algo_name == "FSS_legacy":
+        # Ablation: legacy construction score (no coverage-gain weighting)
+        params.use_phase2 = True
+        params.coverage_gain_auto = False
+        params.coverage_gain_weight = 0.0
+    elif algo_name == "FSS_cov":
+        # Ablation: always-on coverage-gain weighting (corner fix forced everywhere)
+        params.use_phase2 = True
+        params.coverage_gain_auto = False
+        params.coverage_gain_weight = 1.0
     elif algo_name == "FSS_noPhase2":
         params.use_phase2 = False
     elif algo_name == "FSS_noEnergy":
@@ -74,10 +87,64 @@ def _make_fss_params_for_algo(algo_name: str, seed: int) -> FSSParams:
     elif algo_name == "FSS_noLS":
         params.use_phase2 = True
         params.Lmax = 0
+    elif algo_name == "FSS_noRepairReg":
+        # Ablation: disable the repair-dependence regularizer (lambda*P)
+        # This is controlled via FitnessParams.lam in the simulator.
+        params.use_phase2 = True
     else:
         raise ValueError(f"Unknown FSS variant: {algo_name}")
 
     return params
+
+
+def _apply_fss_param_overrides(params: FSSParams, overrides: Dict[str, Any]) -> None:
+    """Apply attribute overrides to an FSSParams instance (best-effort type casting)."""
+
+    if not overrides:
+        return
+
+    for k, v in overrides.items():
+        key = str(k)
+        if not hasattr(params, key):
+            raise ValueError(f"Unknown FSSParams override: {key}")
+
+        cur = getattr(params, key)
+        try:
+            if isinstance(cur, bool):
+                setattr(params, key, bool(v))
+            elif isinstance(cur, int):
+                setattr(params, key, int(v))
+            elif isinstance(cur, float):
+                setattr(params, key, float(v))
+            else:
+                setattr(params, key, v)
+        except Exception as e:
+            raise ValueError(f"Invalid override for {key}: {v} ({e})")
+
+
+def _apply_fitness_param_overrides(params: FitnessParams, overrides: Dict[str, Any]) -> None:
+    """Apply attribute overrides to a FitnessParams instance (best-effort type casting)."""
+
+    if not overrides:
+        return
+
+    for k, v in overrides.items():
+        key = str(k)
+        if not hasattr(params, key):
+            raise ValueError(f"Unknown FitnessParams override: {key}")
+
+        cur = getattr(params, key)
+        try:
+            if isinstance(cur, bool):
+                setattr(params, key, bool(v))
+            elif isinstance(cur, int):
+                setattr(params, key, int(v))
+            elif isinstance(cur, float):
+                setattr(params, key, float(v))
+            else:
+                setattr(params, key, v)
+        except Exception as e:
+            raise ValueError(f"Invalid override for {key}: {v} ({e})")
 
 
 def _ensure_nonempty_ch(net: Network, ch_indices: np.ndarray) -> np.ndarray:
@@ -137,6 +204,8 @@ def simulate_lifetime(
     seed: int,
     max_rounds: int = 5000,
     bs_mode: str = "center",
+    fss_params_overrides: Optional[Dict[str, Any]] = None,
+    fitness_params_overrides: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict, pd.DataFrame]:
     """Simulate network lifetime for one (scenario, algorithm, seed)."""
 
@@ -155,6 +224,16 @@ def simulate_lifetime(
 
     radio = RadioParams()
     fit_params = FitnessParams(rc=25.0)
+    # Keep a single source of truth for the radio model (fitness + simulation).
+    fit_params.radio = radio
+
+    # Ablation: remove the repair-dependence regularizer term (lambda * P(H0)).
+    # We keep repair itself (H+ construction) identical; only the penalty weight is set to 0.
+    if algo_name == "FSS_noRepairReg":
+        fit_params.lam = 0.0
+
+    if fitness_params_overrides:
+        _apply_fitness_param_overrides(fit_params, fitness_params_overrides)
 
     # Protocol states
     leach_state = LEACHState.initialize(net.n_nodes)
@@ -173,6 +252,9 @@ def simulate_lifetime(
     )
     greedy_params = GreedyParams(seed=seed, n_ch=0)
 
+    eem_state = EEMState.initialize(net.n_nodes)
+    eem_params = EEMParams(seed=seed, cr=0.10, mu=0.70)
+
     n0 = int(scenario.n_nodes)
 
     # Lifetime metrics
@@ -190,6 +272,20 @@ def simulate_lifetime(
     delivered_round_history: List[int] = []
     pkts_to_sink_round_history: List[int] = []
     n_ch_round_history: List[int] = []
+
+    # FSS Phase-II diagnostics (per round; defaults for non-FSS)
+    fss_best_source_history: List[str] = []
+    fss_phase2_guard_triggered_history: List[bool] = []
+    fss_phase2_energy_ratio_history: List[float] = []
+
+    # Fitness component diagnostics: phase2 - phase1 (NaN when unavailable)
+    fss_d_CE_history: List[float] = []
+    fss_d_CeD_history: List[float] = []
+    fss_d_CeS_history: List[float] = []
+    fss_d_CeL_history: List[float] = []
+    fss_d_CeR_history: List[float] = []
+    fss_d_P_history: List[float] = []
+    fss_d_F_base_history: List[float] = []
 
     delivered_cum = 0
     pkts_to_sink_cum = 0
@@ -230,10 +326,56 @@ def simulate_lifetime(
         # ---------------- optimization (choose CHs) ----------------
         t0 = perf_counter()
 
+        # Per-round FSS Phase-II diagnostics (defaults)
+        fss_best_source_round = "na"
+        fss_guard_triggered_round = False
+        fss_energy_ratio_round = float("nan")
+
+        d_CE = float("nan")
+        d_CeD = float("nan")
+        d_CeS = float("nan")
+        d_CeL = float("nan")
+        d_CeR = float("nan")
+        d_P = float("nan")
+        d_F_base = float("nan")
+
         if algo_name.startswith("FSS"):
             fss_params = _make_fss_params_for_algo(algo_name, seed=seed + r)
+            if fss_params_overrides:
+                _apply_fss_param_overrides(fss_params, fss_params_overrides)
             res = run_fss_wsn(net, fit_params, fss_params)
             nfe = float(getattr(res, "nfe", 0.0))
+
+            hist = getattr(res, "history", {}) or {}
+            fss_best_source_round = str(hist.get("best_source", "unknown"))
+            fss_guard_triggered_round = bool(hist.get("phase2_guard_triggered", False))
+            e2 = hist.get("phase2_best_energy_est", float("nan"))
+            e1 = hist.get("phase1_best_energy_est", float("nan"))
+            try:
+                e2f = float(e2)
+                e1f = float(e1)
+                fss_energy_ratio_round = float(e2f / e1f) if (np.isfinite(e2f) and np.isfinite(e1f) and e1f != 0.0) else float("nan")
+            except Exception:
+                fss_energy_ratio_round = float("nan")
+
+            # Component deltas: phase2 - phase1
+            def _d(key: str) -> float:
+                try:
+                    p2 = float(hist.get(f"phase2_{key}", float("nan")))
+                    p1 = float(hist.get(f"phase1_{key}", float("nan")))
+                    if np.isfinite(p2) and np.isfinite(p1):
+                        return float(p2 - p1)
+                except Exception:
+                    return float("nan")
+                return float("nan")
+
+            d_CE = _d("CE")
+            d_CeD = _d("CeD")
+            d_CeS = _d("CeS")
+            d_CeL = _d("CeL")
+            d_CeR = _d("CeR")
+            d_P = _d("P")
+            d_F_base = _d("F_base")
 
         elif algo_name == "PSO":
             params = PSOParams(seed=seed + r, n_iter=BUDGET_NITER)
@@ -309,10 +451,29 @@ def simulate_lifetime(
             res = run_greedy_wsn(net, fit_params, greedy_params, round_idx=r)
             nfe = 0.0
 
+        elif algo_name == "EEM_LEACH_ABC":
+            res = run_eem_leach_abc_wsn(
+                net, fit_params, eem_params, round_idx=r, state=eem_state,
+            )
+            nfe = 0.0
+
         else:
             raise ValueError(f"Unknown algorithm {algo_name}")
 
         t1 = perf_counter()
+
+        # Store Phase-II diagnostics (kept for all algos; "na"/NaN for non-FSS)
+        fss_best_source_history.append(str(fss_best_source_round))
+        fss_phase2_guard_triggered_history.append(bool(fss_guard_triggered_round))
+        fss_phase2_energy_ratio_history.append(float(fss_energy_ratio_round))
+
+        fss_d_CE_history.append(float(d_CE))
+        fss_d_CeD_history.append(float(d_CeD))
+        fss_d_CeS_history.append(float(d_CeS))
+        fss_d_CeL_history.append(float(d_CeL))
+        fss_d_CeR_history.append(float(d_CeR))
+        fss_d_P_history.append(float(d_P))
+        fss_d_F_base_history.append(float(d_F_base))
 
         # ---------------- apply radio model ----------------
         ch_indices = _ensure_nonempty_ch(net, res.best_ch_indices)
@@ -444,9 +605,52 @@ def simulate_lifetime(
         "avg_n_ch_raw_round": float(np.mean(n_ch_raw_round_history)) if n_ch_raw_round_history else 0.0,
         "avg_n_ch_added_by_repair_round": float(np.mean(n_ch_added_by_repair_round_history)) if n_ch_added_by_repair_round_history else 0.0,
 
+        # FSS Phase-II diagnostics (meaningful only when algo startswith 'FSS')
+        "fss_frac_best_from_phase2": float(np.mean([s == "phase2" for s in fss_best_source_history])) if fss_best_source_history else float("nan"),
+        "fss_frac_phase2_guard_triggered": float(np.mean(np.asarray(fss_phase2_guard_triggered_history, dtype=float))) if fss_phase2_guard_triggered_history else float("nan"),
+        "fss_phase2_energy_ratio_mean": float(_nanmean(fss_phase2_energy_ratio_history)) if fss_phase2_energy_ratio_history else float("nan"),
+
+        # Component delta means (phase2 - phase1)
+        "fss_d_CE_mean": float(_nanmean(fss_d_CE_history)) if fss_d_CE_history else float("nan"),
+        "fss_d_CeD_mean": float(_nanmean(fss_d_CeD_history)) if fss_d_CeD_history else float("nan"),
+        "fss_d_CeS_mean": float(_nanmean(fss_d_CeS_history)) if fss_d_CeS_history else float("nan"),
+        "fss_d_CeL_mean": float(_nanmean(fss_d_CeL_history)) if fss_d_CeL_history else float("nan"),
+        "fss_d_CeR_mean": float(_nanmean(fss_d_CeR_history)) if fss_d_CeR_history else float("nan"),
+        "fss_d_P_mean": float(_nanmean(fss_d_P_history)) if fss_d_P_history else float("nan"),
+        "fss_d_F_base_mean": float(_nanmean(fss_d_F_base_history)) if fss_d_F_base_history else float("nan"),
+
         "bs_mode": bs_mode,
         "sink_x": float(sink_pos[0]),
         "sink_y": float(sink_pos[1]),
+
+        # -------------------------------------------------
+        # Reproducibility: consolidated config (paper tables)
+        # -------------------------------------------------
+        "budget_niter": int(BUDGET_NITER),
+
+        # Fitness / surrogate weights
+        "fit_rc": float(fit_params.rc),
+        "fit_multihop": bool(getattr(fit_params, "multihop", False)),
+        "fit_r_tx": float(getattr(fit_params, "r_tx", float("nan"))),
+        "fit_w1": float(getattr(fit_params, "w1", float("nan"))),
+        "fit_w2": float(getattr(fit_params, "w2", float("nan"))),
+        "fit_w3": float(getattr(fit_params, "w3", float("nan"))),
+        "fit_lam": float(getattr(fit_params, "lam", float("nan"))),
+        "fit_w_relay": float(getattr(fit_params, "w_relay", float("nan"))),
+
+        # Repair parameters (ties are deterministic: smallest index)
+        "repair_alpha1": float(getattr(getattr(fit_params, "repair", None), "alpha1", float("nan"))),
+        "repair_alpha2": float(getattr(getattr(fit_params, "repair", None), "alpha2", float("nan"))),
+        "repair_alpha3": float(getattr(getattr(fit_params, "repair", None), "alpha3", float("nan"))),
+
+        # Radio model constants (first-order)
+        "radio_E_elec": float(getattr(radio, "E_elec", float("nan"))),
+        "radio_eps_fs": float(getattr(radio, "eps_fs", float("nan"))),
+        "radio_eps_mp": float(getattr(radio, "eps_mp", float("nan"))),
+        "radio_E_da": float(getattr(radio, "E_da", float("nan"))),
+        "radio_l_data": int(getattr(radio, "l_data", 0)),
+        "radio_l_ctrl": int(getattr(radio, "l_ctrl", 0)),
+        "radio_d0": float(getattr(radio, "d0", float("nan"))),
     }
 
     history_df = pd.DataFrame(
@@ -474,6 +678,18 @@ def simulate_lifetime(
 
             "n_ch_raw_round": n_ch_raw_round_history,
             "n_ch_added_by_repair_round": n_ch_added_by_repair_round_history,
+
+            "fss_best_source": fss_best_source_history,
+            "fss_phase2_guard_triggered": fss_phase2_guard_triggered_history,
+            "fss_phase2_energy_ratio": fss_phase2_energy_ratio_history,
+
+            "fss_d_CE": fss_d_CE_history,
+            "fss_d_CeD": fss_d_CeD_history,
+            "fss_d_CeS": fss_d_CeS_history,
+            "fss_d_CeL": fss_d_CeL_history,
+            "fss_d_CeR": fss_d_CeR_history,
+            "fss_d_P": fss_d_P_history,
+            "fss_d_F_base": fss_d_F_base_history,
         }
     )
 
@@ -495,6 +711,8 @@ def run_experiments(
     base_seed: int = 0,
     save_prefix: str | None = None,
     bs_mode: str = "center",
+    fss_params_overrides: Optional[Dict[str, Any]] = None,
+    fitness_params_overrides: Optional[Dict[str, Any]] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Run all experiments and return (summary_df, history_df)."""
 
@@ -506,7 +724,15 @@ def run_experiments(
             for run in range(int(n_runs)):
                 seed = int(base_seed + run)
                 print(f"[run_experiments] {sc.name} - {algo} - run {run}")
-                summary, hist_df = simulate_lifetime(sc, algo, seed, max_rounds=max_rounds, bs_mode=bs_mode)
+                summary, hist_df = simulate_lifetime(
+                    sc,
+                    algo,
+                    seed,
+                    max_rounds=max_rounds,
+                    bs_mode=bs_mode,
+                    fss_params_overrides=fss_params_overrides,
+                    fitness_params_overrides=fitness_params_overrides,
+                )
                 summaries.append(summary)
                 histories.append(hist_df)
 

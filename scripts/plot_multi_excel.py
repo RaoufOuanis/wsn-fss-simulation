@@ -111,6 +111,29 @@ def _resolve_meta_path(excel: Path, raw_path: str) -> Path:
                 best = max(matches, key=_score)
                 return best
 
+        # 6) Search under csv+all/** by filename (common exported dataset location).
+        csv_all_dir = root / "csv+all"
+        if csv_all_dir.is_dir():
+            matches = list(csv_all_dir.rglob(p.name))
+            matches = [m for m in matches if m.is_file()]
+            if matches:
+                excel_parent = excel.parent.resolve()
+
+                def _score(match: Path) -> tuple[int, float]:
+                    try:
+                        mp = match.resolve()
+                        common = len(set(excel_parent.parents).intersection(set(mp.parents)))
+                    except Exception:
+                        common = 0
+                    try:
+                        mtime = match.stat().st_mtime
+                    except Exception:
+                        mtime = 0.0
+                    return (common, mtime)
+
+                best = max(matches, key=_score)
+                return best
+
     tried = "\n".join(f" - {t}" for t in attempted)
     raise FileNotFoundError(
         "Meta path not found: "
@@ -198,8 +221,74 @@ def _extract_metric_by_algo(stats: pd.DataFrame, metric: str) -> pd.DataFrame:
     out = out.rename(columns={mean_col: "mean", std_col: "std"} if std_col in out.columns else {mean_col: "mean"})
     if "std" not in out.columns:
         out["std"] = np.nan
-    out["algo"] = out["algo"].astype(str)
+    # Normalize algo names to reduce accidental mismatches due to whitespace.
+    out["algo"] = out["algo"].astype(str).str.strip()
     return out
+
+
+def _extract_metric_by_algo_from_summary_csv(excel: Path, meta: pd.DataFrame, metric: str) -> pd.DataFrame:
+    """Compute per-algo (mean,std) for metric from raw summary CSV (Meta.summary_csv).
+
+    Used as a robust fallback when an Excel's SummaryStats sheet is incomplete/outdated.
+    """
+
+    df = _load_summary_csv(excel, meta)
+    if "algo" not in df.columns:
+        raise ValueError("summary CSV missing column: algo")
+    if metric not in df.columns:
+        raise ValueError(f"Metric introuvable dans summary CSV: {metric}")
+
+    df = df.copy()
+    df["algo"] = df["algo"].astype(str).str.strip()
+
+    g = df.groupby("algo", dropna=False)[metric]
+    means = g.mean(numeric_only=True)
+    stds = g.std(numeric_only=True)
+    out = pd.DataFrame({"algo": means.index.astype(str), "mean": means.to_numpy(dtype=float), "std": stds.to_numpy(dtype=float)})
+    return out
+
+
+def _extract_metric_by_algo_for_scenario(
+    excel: Path,
+    meta: pd.DataFrame,
+    stats: pd.DataFrame,
+    metric: str,
+    algos: List[str],
+    scenario: str,
+) -> pd.DataFrame:
+    """Try SummaryStats first; fall back to Meta.summary_csv if incomplete."""
+
+    try:
+        df = _extract_metric_by_algo(stats, metric)
+    except Exception:
+        df = pd.DataFrame(columns=["algo", "mean", "std"])
+
+    present = set(df["algo"].astype(str).tolist()) if not df.empty else set()
+    missing = [a for a in algos if a not in present]
+    if missing:
+        try:
+            df2 = _extract_metric_by_algo_from_summary_csv(excel, meta, metric)
+            present2 = set(df2["algo"].astype(str).tolist()) if not df2.empty else set()
+            missing2 = [a for a in algos if a not in present2]
+            if not missing2:
+                print(
+                    f"[plot_multi_excel] Info: using Meta.summary_csv for '{scenario}' (SummaryStats incomplete) | metric={metric}"
+                )
+                return df2
+        except Exception:
+            # Fall back silently; missing bars will be warned by caller.
+            pass
+
+    return df
+
+
+def _warn_missing_algos(per_scenario_missing: Dict[str, List[str]], context: str) -> None:
+    # Keep output concise; this is surfaced in Runner logs.
+    for scenario, missing in per_scenario_missing.items():
+        if not missing:
+            continue
+        preview = ", ".join(missing[:18]) + (" …" if len(missing) > 18 else "")
+        print(f"[plot_multi_excel] Warning ({context}): scenario '{scenario}' is missing algo(s): {preview}")
 
 
 def plot_scenario_compare_bar(
@@ -211,13 +300,26 @@ def plot_scenario_compare_bar(
 ) -> Path:
     rows: List[Dict] = []
 
+    missing_by_scenario: Dict[str, List[str]] = {}
+
     scenario_labels: List[str] = []
     for excel in excels:
         meta, stats, _wil = _load_sheets(excel)
         scenario = _pick_scenario_label(excel, meta)
         scenario_labels.append(scenario)
 
-        df = _extract_metric_by_algo(stats, metric)
+        df = _extract_metric_by_algo_for_scenario(
+            excel=excel,
+            meta=meta,
+            stats=stats,
+            metric=metric,
+            algos=algos,
+            scenario=scenario,
+        )
+        present = set(df["algo"].astype(str).tolist())
+        missing = [a for a in algos if a not in present]
+        if missing:
+            missing_by_scenario[scenario] = missing
         for a in algos:
             sub = df[df["algo"] == a]
             if sub.empty:
@@ -235,6 +337,9 @@ def plot_scenario_compare_bar(
         raise ValueError("Aucune donnée trouvée: vérifiez --metric et --algos")
 
     data = pd.DataFrame(rows)
+
+    if missing_by_scenario:
+        _warn_missing_algos(missing_by_scenario, context=f"bar metric={metric}")
 
     # Sort scenarios by mean for central algo if present; else keep input order
     central = next((a for a in algos if is_central_algo(a)), None)
@@ -318,11 +423,24 @@ def plot_scenario_compare_heatmap(
 ) -> Path:
     rows: List[Dict] = []
     scenario_labels: List[str] = []
+    missing_by_scenario: Dict[str, List[str]] = {}
     for excel in excels:
         meta, stats, _wil = _load_sheets(excel)
         scenario = _pick_scenario_label(excel, meta)
         scenario_labels.append(scenario)
-        df = _extract_metric_by_algo(stats, metric)
+
+        df = _extract_metric_by_algo_for_scenario(
+            excel=excel,
+            meta=meta,
+            stats=stats,
+            metric=metric,
+            algos=algos,
+            scenario=scenario,
+        )
+        present = set(df["algo"].astype(str).tolist())
+        missing = [a for a in algos if a not in present]
+        if missing:
+            missing_by_scenario[scenario] = missing
         for a in algos:
             sub = df[df["algo"] == a]
             if sub.empty:
@@ -333,6 +451,8 @@ def plot_scenario_compare_heatmap(
         raise ValueError("Aucune donnée trouvée: vérifiez --metric et --algos")
 
     data = pd.DataFrame(rows)
+    if missing_by_scenario:
+        _warn_missing_algos(missing_by_scenario, context=f"heatmap metric={metric}")
     scenario_order = list(dict.fromkeys(scenario_labels))
     algo_order = list(algos)
     mat = data.pivot(index="algo", columns="scenario", values="mean").reindex(index=algo_order, columns=scenario_order)
@@ -373,11 +493,24 @@ def plot_scenario_compare_scatter(
 ) -> Path:
     rows: List[Dict] = []
     scenario_labels: List[str] = []
+    missing_by_scenario: Dict[str, List[str]] = {}
     for excel in excels:
         meta, stats, _wil = _load_sheets(excel)
         scenario = _pick_scenario_label(excel, meta)
         scenario_labels.append(scenario)
-        df = _extract_metric_by_algo(stats, metric)
+
+        df = _extract_metric_by_algo_for_scenario(
+            excel=excel,
+            meta=meta,
+            stats=stats,
+            metric=metric,
+            algos=algos,
+            scenario=scenario,
+        )
+        present = set(df["algo"].astype(str).tolist())
+        missing = [a for a in algos if a not in present]
+        if missing:
+            missing_by_scenario[scenario] = missing
         for a in algos:
             sub = df[df["algo"] == a]
             if sub.empty:
@@ -388,6 +521,8 @@ def plot_scenario_compare_scatter(
         raise ValueError("Aucune donnée trouvée: vérifiez --metric et --algos")
 
     data = pd.DataFrame(rows)
+    if missing_by_scenario:
+        _warn_missing_algos(missing_by_scenario, context=f"scatter metric={metric}")
     scenario_order = list(dict.fromkeys(scenario_labels))
 
     fig, ax = plt.subplots(figsize=(max(10, 1.2 * len(scenario_order)), 5.2))
@@ -440,6 +575,7 @@ def plot_scenario_compare_box(
     # One figure per algo: scenarios on x-axis, distribution per scenario.
     scenario_labels: List[str] = []
     per_scenario: Dict[str, pd.DataFrame] = {}
+    present_by_scenario: Dict[str, set[str]] = {}
     for excel in excels:
         meta, _stats, _wil = _load_sheets(excel)
         scenario = _pick_scenario_label(excel, meta)
@@ -448,15 +584,28 @@ def plot_scenario_compare_box(
         if metric not in df.columns:
             raise ValueError(f"Metric introuvable dans summary CSV: {metric}")
         per_scenario[scenario] = df
+        try:
+            present_by_scenario[scenario] = set(df["algo"].astype(str).str.strip().tolist())
+        except Exception:
+            present_by_scenario[scenario] = set()
 
     scenario_order = list(dict.fromkeys(scenario_labels))
     written: List[Path] = []
+
+    missing_by_scenario: Dict[str, List[str]] = {}
+    for sc in scenario_order:
+        present = present_by_scenario.get(sc, set())
+        missing = [a for a in algos if a not in present]
+        if missing:
+            missing_by_scenario[sc] = missing
+    if missing_by_scenario:
+        _warn_missing_algos(missing_by_scenario, context=f"box metric={metric}")
 
     for algo in algos:
         groups = []
         for sc in scenario_order:
             df = per_scenario[sc]
-            vals = df.loc[df["algo"].astype(str) == algo, metric].astype(float).dropna().to_numpy()
+            vals = df.loc[df["algo"].astype(str).str.strip() == algo, metric].astype(float).dropna().to_numpy()
             groups.append(vals)
 
         if not any(len(g) for g in groups):
@@ -507,6 +656,7 @@ def plot_scenario_compare_hist(
 ) -> List[Path]:
     scenario_labels: List[str] = []
     per_scenario: Dict[str, pd.DataFrame] = {}
+    present_by_scenario: Dict[str, set[str]] = {}
     for excel in excels:
         meta, _stats, _wil = _load_sheets(excel)
         scenario = _pick_scenario_label(excel, meta)
@@ -515,16 +665,29 @@ def plot_scenario_compare_hist(
         if metric not in df.columns:
             raise ValueError(f"Metric introuvable dans summary CSV: {metric}")
         per_scenario[scenario] = df
+        try:
+            present_by_scenario[scenario] = set(df["algo"].astype(str).str.strip().tolist())
+        except Exception:
+            present_by_scenario[scenario] = set()
 
     scenario_order = list(dict.fromkeys(scenario_labels))
     written: List[Path] = []
+
+    missing_by_scenario: Dict[str, List[str]] = {}
+    for sc in scenario_order:
+        present = present_by_scenario.get(sc, set())
+        missing = [a for a in algos if a not in present]
+        if missing:
+            missing_by_scenario[sc] = missing
+    if missing_by_scenario:
+        _warn_missing_algos(missing_by_scenario, context=f"hist metric={metric}")
 
     for algo in algos:
         fig, ax = plt.subplots(figsize=(10, 5.2))
         any_data = False
         for sc in scenario_order:
             df = per_scenario[sc]
-            vals = df.loc[df["algo"].astype(str) == algo, metric].astype(float).dropna().to_numpy()
+            vals = df.loc[df["algo"].astype(str).str.strip() == algo, metric].astype(float).dropna().to_numpy()
             if len(vals) == 0:
                 continue
             any_data = True
@@ -570,6 +733,7 @@ def plot_scenario_compare_line(
     per_scenario_ts: Dict[str, pd.DataFrame] = {}
     per_scenario_metric_col: Dict[str, str] = {}
     label_metric = metric
+    present_by_scenario: Dict[str, set[str]] = {}
     for excel in excels:
         meta, _stats, _wil = _load_sheets(excel)
         scenario = _pick_scenario_label(excel, meta)
@@ -578,9 +742,22 @@ def plot_scenario_compare_line(
         col, label_metric = _resolve_timeseries_metric_column(ts, metric)
         per_scenario_metric_col[scenario] = col
         per_scenario_ts[scenario] = ts
+        try:
+            present_by_scenario[scenario] = set(ts["algo"].astype(str).str.strip().tolist())
+        except Exception:
+            present_by_scenario[scenario] = set()
 
     scenario_order = list(dict.fromkeys(scenario_labels))
     written: List[Path] = []
+
+    missing_by_scenario: Dict[str, List[str]] = {}
+    for sc in scenario_order:
+        present = present_by_scenario.get(sc, set())
+        missing = [a for a in algos if a not in present]
+        if missing:
+            missing_by_scenario[sc] = missing
+    if missing_by_scenario:
+        _warn_missing_algos(missing_by_scenario, context=f"line metric={metric}")
 
     # One figure per algo: scenarios as different linestyles.
     linestyles = ["-", "--", ":", "-."]
@@ -591,7 +768,7 @@ def plot_scenario_compare_line(
         for i, sc in enumerate(scenario_order):
             ts = per_scenario_ts[sc]
             metric_col = per_scenario_metric_col[sc]
-            sub = ts.loc[ts["algo"].astype(str) == algo, ["round", metric_col]].copy()
+            sub = ts.loc[ts["algo"].astype(str).str.strip() == algo, ["round", metric_col]].copy()
             if sub.empty:
                 continue
             any_data = True

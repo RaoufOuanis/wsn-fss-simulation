@@ -4,16 +4,78 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from pathlib import Path
+import sys
 from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
 from scipy.stats import wilcoxon
 
+# Allow running as a script: `python scripts/report_excel.py ...`
+# (script directory would otherwise hide the project root from imports).
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
 from wsn.plot_style import direction_phrase, metric_display_name
 
 
 KEY_COLS = {"scenario", "algo", "seed", "bs_mode", "sink_x", "sink_y"}
+
+
+CONFIG_COLS_ORDER = [
+    # Budget
+    "budget_niter",
+    # Fitness / surrogate
+    "fit_rc",
+    "fit_multihop",
+    "fit_r_tx",
+    "fit_w1",
+    "fit_w2",
+    "fit_w3",
+    "fit_lam",
+    "fit_w_relay",
+    # Repair
+    "repair_alpha1",
+    "repair_alpha2",
+    "repair_alpha3",
+    # Radio
+    "radio_E_elec",
+    "radio_eps_fs",
+    "radio_eps_mp",
+    "radio_E_da",
+    "radio_l_data",
+    "radio_l_ctrl",
+    "radio_d0",
+]
+
+
+def _build_config_sheet(summary_df: pd.DataFrame) -> pd.DataFrame:
+    """Create a compact key/value sheet for reproducibility-critical constants."""
+
+    rows: List[Dict[str, str]] = []
+    for k in CONFIG_COLS_ORDER:
+        if k not in summary_df.columns:
+            continue
+        s = summary_df[k]
+        try:
+            uniq = [x for x in s.dropna().unique().tolist()]
+        except Exception:
+            uniq = []
+
+        if len(uniq) == 0:
+            val = "(missing)"
+        elif len(uniq) == 1:
+            val = str(uniq[0])
+        else:
+            # Keep it short; the raw CSV contains the full column.
+            shown = ", ".join(str(x) for x in uniq[:8])
+            suffix = "" if len(uniq) <= 8 else f" … (+{len(uniq) - 8})"
+            val = "VARIES: " + shown + suffix
+
+        rows.append({"key": str(k), "value": val})
+
+    return pd.DataFrame(rows)
 
 
 CORE_METRICS_ORDER = [
@@ -381,6 +443,10 @@ def main() -> None:
                 }
             )
             meta.to_excel(writer, sheet_name="Meta", index=False)
+
+            cfg_df = _build_config_sheet(summary_df)
+            if not cfg_df.empty:
+                cfg_df.to_excel(writer, sheet_name="Config", index=False)
 
             stats_df.to_excel(writer, sheet_name="SummaryStats", index=False)
             wil_df.to_excel(writer, sheet_name="Wilcoxon", index=False)

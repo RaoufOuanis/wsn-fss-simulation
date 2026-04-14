@@ -2,16 +2,24 @@
 from __future__ import annotations
 
 import os
+import json
 import re
 import sys
 import time
 import queue
+import shutil
 import threading
 import subprocess
 import difflib
-from datetime import datetime
+import traceback
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+try:
+    import psutil  # type: ignore
+except Exception:  # pragma: no cover
+    psutil = None
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -23,24 +31,91 @@ from wsn.plot_style import ALGO_COLOR_MAP
 
 WORKDIR_DEFAULT = Path(r"C:\wsn-project")
 
-RUNS_FIXED = 5
+# Persist small UI settings (e.g., dark mode) across restarts.
+CONFIG_PATH = Path.home() / ".wsn_runner_config.json"
+
+# Default campaign size: historically 6 jobs × 5 runs = 30 seeds.
+SEEDS_TOTAL_DEFAULT = 30
+
+# Default parallelism: start with 6 jobs as before, but allow the user to raise it.
+PARALLEL_JOBS_DEFAULT = 6
+
+# Periodic mini-log interval (seconds) for long runs.
+HEARTBEAT_INTERVAL_S_DEFAULT = 0.0
 
 # Keep a constrained dropdown list as requested.
 ROUND_VALUES = [str(r) for r in range(200, 5001, 100)]
 
-GUI_EXTRA_ALGOS = ["SO", "GJO", "EMOGJO", "EMOGJO_paperCH", "ESOGJO"]
+GUI_EXTRA_ALGOS = ["SO", "GJO", "EMOGJO", "EMOGJO_paperCH", "ESOGJO", "FSS_legacy", "FSS_cov"]
 
-S1_ALGOS_DEFAULT = "FSS,PSO,GWO,ABC,SO,GJO,EMOGJO,ESOGJO,LEACH,HEED,SEP"
-S2_ALGOS_DEFAULT = "FSS,PSO,GWO,ABC,SO,GJO,EMOGJO,ESOGJO,LEACH,HEED,SEP"
+S1_ALGOS_DEFAULT = "FSS,PSO,GWO,ABC,SO,GJO,EMOGJO,ESOGJO,LEACH,HEED,SEP,EEM_LEACH_ABC"
+S2_ALGOS_DEFAULT = "FSS,PSO,GWO,ABC,SO,GJO,EMOGJO,ESOGJO,LEACH,HEED,SEP,EEM_LEACH_ABC"
 
-JOB_SUFFIXES: List[Tuple[str, int]] = [
-    ("s00_04", 0),
-    ("s05_09", 5),
-    ("s10_14", 10),
-    ("s15_19", 15),
-    ("s20_24", 20),
-    ("s25_29", 25),
-]
+# Algorithms considered negligible for ETA estimation (per user request).
+ETA_FAST_ALGOS = {"LEACH", "HEED", "SEP", "EEM_LEACH_ABC"}
+
+
+# Per-run persistence to enable resume on next startup.
+RUNS_DIR_NAME = "_runner_runs"
+RUN_SESSION_FILE = "session.json"
+
+
+def _write_json_atomic(path: Path, data: Dict[str, Any]) -> None:
+    """Best-effort atomic JSON write."""
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _read_json(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        if not path.exists():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        return None
+    return None
+
+
+def _make_seed_jobs(prefix_base: str, total_seeds: int, parallel_jobs: int) -> List[Tuple[str, int, int]]:
+    """Split a fixed number of seeds across parallel jobs.
+
+    We keep seed uniqueness by assigning each job a contiguous seed block.
+    Each job runs `runs_job` seeds starting from `base_seed`.
+
+    Returns a list of (prefix, base_seed, runs_job).
+    """
+
+    total = int(total_seeds)
+    if total <= 0:
+        return []
+
+    nj = int(max(1, parallel_jobs))
+    nj = min(nj, total)  # do not create empty jobs
+
+    base = total // nj
+    rem = total % nj
+
+    jobs: List[Tuple[str, int, int]] = []
+    seed0 = 0
+    for j in range(nj):
+        runs_job = base + (1 if j < rem else 0)
+        if runs_job <= 0:
+            continue
+        start = seed0
+        end = seed0 + runs_job - 1
+        suffix = f"s{start:02d}_{end:02d}"
+        jobs.append((f"{prefix_base}_{suffix}", int(seed0), int(runs_job)))
+        seed0 += runs_job
+
+    return jobs
 
 RUN_LINE_RE = re.compile(r"^\[run_experiments\]\s+(?P<scenario>[^-]+?)\s+-\s+(?P<algo>[^-]+?)\s+-\s+run\s+(?P<run>\d+)\s*$")
 
@@ -55,11 +130,9 @@ def _campaign_prefix_base(scenario_tag: str, bs_mode: str, rounds: int) -> str:
     return f"paper_{scenario_tag}_{bs_mode}_R{rounds}"
 
 
-def _make_jobs(prefix_base: str) -> List[Tuple[str, int]]:
-    jobs: List[Tuple[str, int]] = []
-    for suffix, base_seed in JOB_SUFFIXES:
-        jobs.append((f"{prefix_base}_{suffix}", base_seed))
-    return jobs
+def _make_jobs(prefix_base: str, total_seeds: int, parallel_jobs: int) -> List[Tuple[str, int, int]]:
+    # Backward-compatible name kept for older call sites.
+    return _make_seed_jobs(prefix_base, total_seeds=total_seeds, parallel_jobs=parallel_jobs)
 
 
 def _list_all_prefixes(workdir: Path) -> List[str]:
@@ -141,8 +214,8 @@ class RunnerApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("WSN Runner")
-        # The UI contains 2 stacked control panels (Simulation + Graphiques) plus logs.
-        # A taller default prevents the 'Graphiques' menu from being clipped on startup.
+        # The UI contains 2 stacked control panels (Simulation + Plots) plus logs.
+        # A taller default prevents the Plots panel from being clipped on startup.
         self.root.geometry("900x760")
 
         self._stop_event = threading.Event()
@@ -150,16 +223,41 @@ class RunnerApp:
         self._proc: Optional[subprocess.Popen] = None
         self._log_queue: queue.Queue[str] = queue.Queue()
 
+        # Track all currently running subprocesses (simulate/merge/excel/plots + parallel jobs)
+        self._procs_lock = threading.Lock()
+        self._active_procs: dict[int, subprocess.Popen] = {}
+        self._paused: bool = False
+
         self.workdir_var = tk.StringVar(value=str(WORKDIR_DEFAULT))
 
         self.mode_var = tk.StringVar(value="simulate")  # simulate | excel | plots
         self.shell_var = tk.StringVar(value="powershell")  # powershell | cmd
 
+        # Logging verbosity
+        # When disabled, we still parse/count run lines but do not print each one.
+        self.verbose_logs_var = tk.BooleanVar(value=False)
+
+        # Theme
+        self.dark_mode_var = tk.BooleanVar(value=False)
+
+        # Load persisted UI settings (best-effort).
+        try:
+            self._load_settings()
+        except Exception:
+            pass
+
         self.scenario_var = tk.StringVar(value="S1_100")
         self.bs_var = tk.StringVar(value="center")
 
+        # Campaign sizing / parallelism
+        self.seeds_total_var = tk.StringVar(value=str(SEEDS_TOTAL_DEFAULT))
+        self.parallel_jobs_var = tk.StringVar(value=str(PARALLEL_JOBS_DEFAULT))
+
         self.rounds_var = tk.StringVar(value="2200")
         self.algos_var = tk.StringVar(value=S1_ALGOS_DEFAULT)
+
+        # Quick-add algorithm picker (for building the CSV list)
+        self._algo_add_var = tk.StringVar(value="")
 
         # Wilcoxon reference algorithm (protocol: compare FSS vs each baseline)
         self.baseline_algo_var = tk.StringVar(value="FSS")
@@ -192,8 +290,11 @@ class RunnerApp:
             "mh_q_max",
             "mh_jain_q",
             "avg_cpu_time",
-            "nfe",
+            "avg_nfe",
             "avg_pkt_hops_round",
+            "avg_n_ch_round",
+            "avg_n_ch_raw_round",
+            "avg_n_ch_added_by_repair_round",
         ]
         self._metric_radio_buttons: List[ttk.Radiobutton] = []
         self._metric_checkbuttons: List[ttk.Checkbutton] = []
@@ -210,22 +311,383 @@ class RunnerApp:
         self.progress_var = tk.DoubleVar(value=0.0)
         self.progress_text_var = tk.StringVar(value="0%")
         self.eta_var = tk.StringVar(value="ETA: --")
+        self.finish_time_var = tk.StringVar(value="Fin: --")
 
         self._progress_total_units: int = 0
         self._progress_done_units: int = 0
         self._progress_t0: float = 0.0
         self._progress_lock = threading.Lock()
 
+        # Last algo seen from a run progress line (used for heartbeat logs)
+        self._last_run_algo: str = ""
+        self._last_run_scenario: str = ""
+        self._last_run_run: Optional[int] = None
+        self._last_run_seed: Optional[int] = None
+
+        # Campaign context (for more readable progress)
+        self._campaign_algos_count: int = 0
+        self._campaign_total_seeds: int = 0
+
+        # ETA estimator state (smoothed units/sec)
+        self._eta_last_t: float = 0.0
+        self._eta_last_done: int = 0
+        self._eta_rate_ema: float = 0.0
+
+        # Periodic mini-logs (heartbeat)
+        self._hb_last_t: float = 0.0
+        self._hb_interval_s: float = float(HEARTBEAT_INTERVAL_S_DEFAULT)
+
+        # Optional ETA override (e.g., job-duration-based ETA)
+        self._eta_override_s: Optional[int] = None
+        self._eta_override_finish_dt: Optional[datetime] = None
+
+        # Per-job stdout tee logs (created during parallel simulation; cleaned up on success)
+        self._job_logs_dir: Optional[Path] = None
+
+        # Persisted run session (for resume on next startup)
+        self._run_session_dir: Optional[Path] = None
+        self._run_session_file: Optional[Path] = None
+        self._resume_session_dir: Optional[Path] = None
+
         self._build_ui()
+
+        # Ensure we always kill spawned processes when the window is closed.
+        try:
+            self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        except Exception:
+            pass
+
+        # Capture Tk callback exceptions (otherwise they can be "silent").
+        try:
+            self.root.report_callback_exception = self._on_tk_exception  # type: ignore[assignment]
+        except Exception:
+            pass
+
         self._refresh_dynamic_lists()
         self._refresh_compare_algos_help()
-        self._log_queue.put(f"[time] {_system_time_str()} - Application lancée.\n")
+        self._log_queue.put(f"[time] {_system_time_str()} - Application started.\n")
         self._tick_ui()
+
+        # Apply initial theme
+        try:
+            self._apply_theme(bool(self.dark_mode_var.get()))
+        except Exception:
+            pass
+
+        # Offer resume for the latest unfinished run (best-effort).
+        try:
+            self.root.after(350, self._maybe_offer_resume_on_startup)
+        except Exception:
+            pass
+
+    def _session_set(self, update: Dict[str, Any]) -> None:
+        """Merge-update and persist the current run session manifest."""
+
+        if self._run_session_file is None:
+            return
+        cur = _read_json(self._run_session_file) or {}
+        if not isinstance(cur, dict):
+            cur = {}
+        cur.update(update)
+        cur["updated_at"] = _system_time_str()
+        try:
+            _write_json_atomic(self._run_session_file, cur)
+        except Exception:
+            return
+
+    def _session_set_step(self, step: str, status: str) -> None:
+        if self._run_session_file is None:
+            return
+        cur = _read_json(self._run_session_file) or {}
+        steps = cur.get("steps")
+        if not isinstance(steps, dict):
+            steps = {}
+        steps[str(step)] = str(status)
+        cur["steps"] = steps
+        cur["updated_at"] = _system_time_str()
+        try:
+            _write_json_atomic(self._run_session_file, cur)
+        except Exception:
+            return
+
+    def _maybe_offer_resume_on_startup(self) -> None:
+        """Detect latest unfinished session in current workdir and offer resume."""
+
+        try:
+            workdir = Path(self.workdir_var.get())
+        except Exception:
+            return
+
+        runs_root = workdir / RUNS_DIR_NAME
+        if not runs_root.exists():
+            return
+
+        best_dir: Optional[Path] = None
+        best_mtime: float = -1.0
+        best_manifest: Optional[Dict[str, Any]] = None
+
+        try:
+            for d in runs_root.iterdir():
+                if not d.is_dir():
+                    continue
+                mf = d / RUN_SESSION_FILE
+                manifest = _read_json(mf)
+                if not manifest:
+                    continue
+                if str(manifest.get("mode") or "") != "simulate":
+                    continue
+                status = str(manifest.get("status") or "")
+                if status in {"complete", "dismissed", "abandoned"}:
+                    continue
+                try:
+                    mtime = float(mf.stat().st_mtime)
+                except Exception:
+                    mtime = 0.0
+                if mtime > best_mtime:
+                    best_dir = d
+                    best_mtime = mtime
+                    best_manifest = manifest
+        except Exception:
+            return
+
+        if best_dir is None or best_manifest is None:
+            return
+
+        started = str(best_manifest.get("started_at") or "(unknown)")
+        status = str(best_manifest.get("status") or "unfinished")
+
+        try:
+            if not bool(messagebox.askyesno("Resume", f"Found an unfinished run ({status}) from {started}.\n\nResume it?")):
+                # User refused resume: delete ALL logs and session metadata.
+                # Primary behavior: remove the whole session directory.
+                removed = False
+                try:
+                    shutil.rmtree(Path(best_dir), ignore_errors=False)
+                    removed = True
+                except Exception:
+                    removed = False
+
+                # Fallback: if deletion fails, at least delete job logs + mark dismissed
+                # so we won't keep re-prompting.
+                if not removed:
+                    try:
+                        logs_dir = Path(best_dir) / "job_logs"
+                        shutil.rmtree(logs_dir, ignore_errors=True)
+                    except Exception:
+                        pass
+                    try:
+                        mf = Path(best_dir) / RUN_SESSION_FILE
+                        manifest = _read_json(mf) or {}
+                        if isinstance(manifest, dict):
+                            manifest["status"] = "dismissed"
+                            manifest["updated_at"] = _system_time_str()
+                            _write_json_atomic(mf, manifest)
+                    except Exception:
+                        pass
+                return
+        except Exception:
+            return
+
+        # Load params into UI (best-effort), then start in resume mode.
+        params = best_manifest.get("params")
+        if isinstance(params, dict):
+            try:
+                if "workdir" in params:
+                    self.workdir_var.set(str(params.get("workdir")))
+                if "scenario" in params:
+                    self.scenario_var.set(str(params.get("scenario")))
+                if "bs" in params:
+                    self.bs_var.set(str(params.get("bs")))
+                if "seeds_total" in params:
+                    self.seeds_total_var.set(str(params.get("seeds_total")))
+                if "parallel_jobs" in params:
+                    self.parallel_jobs_var.set(str(params.get("parallel_jobs")))
+                if "rounds" in params:
+                    self.rounds_var.set(str(params.get("rounds")))
+                if "algos" in params:
+                    self.algos_var.set(str(params.get("algos")))
+                if "baseline_algo" in params:
+                    self.baseline_algo_var.set(str(params.get("baseline_algo")))
+                if "correction" in params:
+                    self.correction_var.set(str(params.get("correction")))
+            except Exception:
+                pass
+
+        try:
+            self.mode_var.set("simulate")
+            self._refresh_dynamic_lists()
+        except Exception:
+            pass
+
+        self._resume_session_dir = Path(best_dir)
+        self._on_start()
+
+    def _load_settings(self) -> None:
+        try:
+            p = Path(CONFIG_PATH)
+            if not p.exists():
+                return
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return
+            if "dark_mode" in data:
+                self.dark_mode_var.set(bool(data.get("dark_mode")))
+        except Exception:
+            return
+
+    def _save_settings(self) -> None:
+        try:
+            data = {
+                "dark_mode": bool(self.dark_mode_var.get()),
+            }
+            p = Path(CONFIG_PATH)
+            try:
+                p.parent.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+            tmp = p.with_suffix(p.suffix + ".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(p)
+        except Exception:
+            return
+
+    def _on_toggle_dark_mode(self) -> None:
+        dark = bool(self.dark_mode_var.get())
+        self._apply_theme(dark)
+        self._save_settings()
+
+    def _apply_theme(self, dark: bool) -> None:
+        """Best-effort dark mode for ttk + the log Text widget."""
+
+        style = ttk.Style(self.root)
+        if not hasattr(self, "_default_ttk_theme"):
+            try:
+                self._default_ttk_theme = style.theme_use()
+            except Exception:
+                self._default_ttk_theme = "default"
+
+        if dark:
+            try:
+                style.theme_use("clam")
+            except Exception:
+                pass
+
+            bg = "#1e1e1e"
+            fg = "#d4d4d4"
+            widget_bg = "#252526"
+            accent = "#3a3a3a"
+
+            # For readability on some Windows themes, keep entry/combobox fields light
+            # and use black text (user request).
+            field_bg = "white"
+            field_fg = "black"
+
+            try:
+                self.root.configure(bg=bg)
+            except Exception:
+                pass
+
+            for key in ["TFrame", "TLabel", "TButton", "TRadiobutton", "TCheckbutton"]:
+                try:
+                    style.configure(key, background=bg, foreground=fg)
+                except Exception:
+                    pass
+            for key in ["TLabelframe", "TLabelframe.Label"]:
+                try:
+                    style.configure(key, background=bg, foreground=fg)
+                except Exception:
+                    pass
+            for key in ["TEntry", "TCombobox"]:
+                try:
+                    style.configure(key, fieldbackground=field_bg, background=field_bg, foreground=field_fg)
+                except Exception:
+                    pass
+
+            # Combobox drop-down list styling (best-effort; Tk option database).
+            try:
+                self.root.option_add("*TCombobox*Listbox.background", field_bg)
+                self.root.option_add("*TCombobox*Listbox.foreground", field_fg)
+            except Exception:
+                pass
+            try:
+                style.configure("TProgressbar", background=accent)
+            except Exception:
+                pass
+
+            try:
+                self.log_text.configure(
+                    bg=widget_bg,
+                    fg=fg,
+                    insertbackground=fg,
+                    selectbackground=accent,
+                )
+            except Exception:
+                pass
+        else:
+            try:
+                style.theme_use(str(getattr(self, "_default_ttk_theme", "default")))
+            except Exception:
+                pass
+            try:
+                self.root.configure(bg=None)
+            except Exception:
+                pass
+            try:
+                self.log_text.configure(bg="white", fg="black", insertbackground="black")
+            except Exception:
+                pass
+
+    def _on_tk_exception(self, exc, val, tb) -> None:
+        # Called by Tk when a callback raises.
+        try:
+            lines = traceback.format_exception(exc, val, tb)
+            self._log_queue.put("[tk] Exception in Tk callback:\n" + "".join(lines) + "\n")
+        except Exception:
+            self._log_queue.put("[tk] Exception in Tk callback (traceback unavailable).\n")
+
+        # Best-effort: avoid leaving orphan processes.
+        try:
+            self._stop_event.set()
+            self._kill_all_processes()
+        except Exception:
+            pass
+
+        # Show error to user (must be on UI thread).
+        try:
+            self._ui_show_error("Tk Error", str(val) if val is not None else "Unknown error")
+        except Exception:
+            pass
+
+    def _ui_show_error(self, title: str, msg: str) -> None:
+        def _show() -> None:
+            try:
+                messagebox.showerror(title, msg)
+            except Exception:
+                pass
+
+        try:
+            self.root.after(0, _show)
+        except Exception:
+            pass
 
     @staticmethod
     def _split_csv_names(s: str) -> List[str]:
         parts = [p.strip() for p in str(s).split(",")]
         return [p for p in parts if p]
+
+    def _known_algos_for_picker(self) -> List[str]:
+        known = sorted((set(ALGO_COLOR_MAP.keys()) | set(GUI_EXTRA_ALGOS)), key=lambda x: (x != "FSS", x.lower()))
+        return [str(a) for a in known if str(a).strip()]
+
+    def _add_algo_to_csv_var(self, var: tk.StringVar, algo: str) -> None:
+        a = str(algo).strip()
+        if not a:
+            return
+        cur = self._split_csv_names(var.get())
+        if a in cur:
+            return
+        cur.append(a)
+        var.set(",".join(cur))
 
     @staticmethod
     def _format_short_list(items: List[str], max_items: int = 14) -> str:
@@ -242,10 +704,10 @@ class RunnerApp:
 
         if self._compare_algos_available:
             disp = self._format_short_list(self._compare_algos_available)
-            self.compare_algos_help_var.set(f"Disponibles (dans Excel sélectionnés): {disp}  |  Saisir séparés par virgules")
+            self.compare_algos_help_var.set(f"Available (in selected Excel): {disp}  |  Comma-separated")
         else:
             disp = self._format_short_list(base)
-            self.compare_algos_help_var.set(f"Noms courants: {disp}  |  Saisir séparés par virgules")
+            self.compare_algos_help_var.set(f"Common names: {disp}  |  Comma-separated")
 
     def _detect_algos_from_excels(self, excels: List[str]) -> List[str]:
         found: set[str] = set()
@@ -272,7 +734,7 @@ class RunnerApp:
 
         parsed = self._split_csv_names(raw)
         if not parsed:
-            raise ValueError("Liste d'algorithmes vide")
+            raise ValueError("Empty algorithms list")
 
         # Deduplicate while preserving order (common user mistake: typing FSS twice)
         seen: set[str] = set()
@@ -293,16 +755,16 @@ class RunnerApp:
                 if sugg:
                     suggestions.append(f"{u} → {', '.join(sugg)}")
                 else:
-                    suggestions.append(f"{u} → (aucune suggestion)")
+                    suggestions.append(f"{u} → (no suggestion)")
 
             avail_text = self._format_short_list(sorted(allowed, key=lambda x: (x != "FSS", x.lower())))
             msg = (
-                "Algorithme(s) inconnu(s) dans 'Algorithmes (scénarios)':\n"
+                "Unknown algorithm(s) in 'Algorithms (scenarios)':\n"
                 + " - "
                 + "\n - ".join(unknown)
                 + "\n\nSuggestions:\n - "
                 + "\n - ".join(suggestions)
-                + "\n\nDisponibles:\n"
+                + "\n\nAvailable:\n"
                 + avail_text
             )
             raise ValueError(msg)
@@ -314,9 +776,9 @@ class RunnerApp:
         top = ttk.Frame(self.root, padding=10)
         top.pack(fill="x")
 
-        ttk.Label(top, text="Dossier de travail:").grid(row=0, column=0, sticky="w")
+        ttk.Label(top, text="Working directory:").grid(row=0, column=0, sticky="w")
         ttk.Entry(top, textvariable=self.workdir_var, width=70).grid(row=0, column=1, sticky="we", padx=6)
-        ttk.Button(top, text="Parcourir...", command=self._choose_workdir).grid(row=0, column=2, sticky="e")
+        ttk.Button(top, text="Browse...", command=self._choose_workdir).grid(row=0, column=2, sticky="e")
 
         ttk.Label(top, text="Shell:").grid(row=1, column=0, sticky="w", pady=(8, 0))
         shell_frame = ttk.Frame(top)
@@ -327,16 +789,16 @@ class RunnerApp:
         ttk.Label(top, text="Mode:").grid(row=2, column=0, sticky="w", pady=(8, 0))
         mode_frame = ttk.Frame(top)
         mode_frame.grid(row=2, column=1, sticky="w", pady=(8, 0))
-        ttk.Radiobutton(mode_frame, text="Simulation → Merge → Excel → Graphiques", value="simulate", variable=self.mode_var, command=self._update_mode_visibility).pack(side="left")
-        ttk.Radiobutton(mode_frame, text="Excel depuis CSV *_ALL_*", value="excel", variable=self.mode_var, command=self._update_mode_visibility).pack(side="left", padx=(12, 0))
-        ttk.Radiobutton(mode_frame, text="Graphiques depuis Excel", value="plots", variable=self.mode_var, command=self._update_mode_visibility).pack(side="left", padx=(12, 0))
+        ttk.Radiobutton(mode_frame, text="Simulate → Merge → Excel → Plots", value="simulate", variable=self.mode_var, command=self._update_mode_visibility).pack(side="left")
+        ttk.Radiobutton(mode_frame, text="Excel from CSV *_ALL_*", value="excel", variable=self.mode_var, command=self._update_mode_visibility).pack(side="left", padx=(12, 0))
+        ttk.Radiobutton(mode_frame, text="Plots from Excel", value="plots", variable=self.mode_var, command=self._update_mode_visibility).pack(side="left", padx=(12, 0))
 
         top.columnconfigure(1, weight=1)
 
         # Main frames
         self.sim_frame = ttk.LabelFrame(self.root, text="Simulation", padding=10)
-        self.excel_frame = ttk.LabelFrame(self.root, text="Générer Excel", padding=10)
-        self.plots_frame = ttk.LabelFrame(self.root, text="Graphiques", padding=10)
+        self.excel_frame = ttk.LabelFrame(self.root, text="Generate Excel", padding=10)
+        self.plots_frame = ttk.LabelFrame(self.root, text="Plots", padding=10)
 
         self.sim_frame.pack(fill="x", padx=10, pady=(0, 8))
         self.excel_frame.pack(fill="x", padx=10, pady=(0, 8))
@@ -351,18 +813,31 @@ class RunnerApp:
         bottom.pack(fill="x")
 
         ttk.Progressbar(bottom, variable=self.progress_var, maximum=100.0).grid(row=0, column=0, sticky="we")
-        ttk.Label(bottom, textvariable=self.progress_text_var, width=10).grid(row=0, column=1, padx=(8, 0))
-        ttk.Label(bottom, textvariable=self.eta_var, width=18).grid(row=0, column=2, padx=(8, 0))
+        ttk.Label(bottom, textvariable=self.progress_text_var, width=7).grid(row=0, column=1, padx=(8, 0), sticky="w")
+        ttk.Label(bottom, textvariable=self.eta_var).grid(row=0, column=2, padx=(8, 0), sticky="w")
+        ttk.Label(bottom, textvariable=self.finish_time_var).grid(row=0, column=3, padx=(8, 0), sticky="w")
 
         btns = ttk.Frame(bottom)
         btns.grid(row=1, column=0, columnspan=3, sticky="we", pady=(8, 0))
-        self.start_btn = ttk.Button(btns, text="Démarrer", command=self._on_start)
+        self.start_btn = ttk.Button(btns, text="Start", command=self._on_start)
         self.start_btn.pack(side="left")
-        self.stop_btn = ttk.Button(btns, text="Arrêter", command=self._on_stop, state="disabled")
+        self.pause_btn = ttk.Button(btns, text="Pause", command=self._on_pause, state="disabled")
+        self.pause_btn.pack(side="left", padx=(8, 0))
+        self.stop_btn = ttk.Button(btns, text="Stop", command=self._on_stop, state="disabled")
         self.stop_btn.pack(side="left", padx=(8, 0))
-        ttk.Button(btns, text="Rafraîchir listes", command=self._refresh_dynamic_lists).pack(side="right")
+        ttk.Checkbutton(btns, text="Detailed logs", variable=self.verbose_logs_var).pack(side="left", padx=(12, 0))
+        ttk.Checkbutton(
+            btns,
+            text="Dark mode",
+            variable=self.dark_mode_var,
+            command=self._on_toggle_dark_mode,
+        ).pack(side="left", padx=(12, 0))
+        ttk.Button(btns, text="Refresh lists", command=self._refresh_dynamic_lists).pack(side="right")
 
         bottom.columnconfigure(0, weight=1)
+        bottom.columnconfigure(1, weight=0)
+        bottom.columnconfigure(2, weight=0)
+        bottom.columnconfigure(3, weight=0)
 
         # Logs
         log_frame = ttk.LabelFrame(self.root, text="Log", padding=10)
@@ -382,33 +857,53 @@ class RunnerApp:
         ttk.Label(self.sim_frame, text="BS:").grid(row=0, column=2, sticky="w", padx=(14, 0))
         ttk.Combobox(self.sim_frame, textvariable=self.bs_var, values=["center", "corner"], state="readonly", width=10).grid(row=0, column=3, sticky="w")
 
-        ttk.Label(self.sim_frame, text="Runs (fixé):").grid(row=1, column=0, sticky="w", pady=(8, 0))
-        ttk.Label(self.sim_frame, text=f"{RUNS_FIXED}  (6 jobs → 30 seeds)").grid(row=1, column=1, sticky="w", pady=(8, 0))
+        ttk.Label(self.sim_frame, text="Total seeds (per campaign):").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(self.sim_frame, textvariable=self.seeds_total_var, width=10).grid(row=1, column=1, sticky="w", pady=(8, 0))
 
-        ttk.Label(self.sim_frame, text="Rounds (200..5000):").grid(row=1, column=2, sticky="w", padx=(14, 0), pady=(8, 0))
-        ttk.Combobox(self.sim_frame, textvariable=self.rounds_var, values=ROUND_VALUES, state="readonly", width=10).grid(row=1, column=3, sticky="w", pady=(8, 0))
+        ttk.Label(self.sim_frame, text="Parallel jobs:").grid(row=1, column=2, sticky="w", padx=(14, 0), pady=(8, 0))
+        ttk.Entry(self.sim_frame, textvariable=self.parallel_jobs_var, width=10).grid(row=1, column=3, sticky="w", pady=(8, 0))
 
-        ttk.Label(self.sim_frame, text="Algorithmes (CSV):").grid(row=2, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(self.sim_frame, textvariable=self.algos_var, width=60).grid(row=2, column=1, columnspan=3, sticky="we", pady=(8, 0))
+        ttk.Label(self.sim_frame, text="Algorithms (CSV):").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(self.sim_frame, textvariable=self.algos_var, width=60).grid(row=2, column=1, columnspan=4, sticky="we", pady=(8, 0))
 
-        ttk.Label(self.sim_frame, text="Reference (Wilcoxon):").grid(row=3, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(self.sim_frame, textvariable=self.baseline_algo_var, width=12).grid(row=3, column=1, sticky="w", pady=(8, 0))
+        # Keep rounds + quick-add on their own row to avoid clipping/overlap.
+        ttk.Label(self.sim_frame, text="Rounds (200..5000):").grid(row=3, column=0, sticky="w", pady=(8, 0))
+        ttk.Combobox(self.sim_frame, textvariable=self.rounds_var, values=ROUND_VALUES, state="readonly", width=10).grid(row=3, column=1, sticky="w", pady=(8, 0))
 
-        ttk.Label(self.sim_frame, text="Correction:").grid(row=3, column=2, sticky="w", padx=(14, 0), pady=(8, 0))
-        ttk.Combobox(self.sim_frame, textvariable=self.correction_var, values=["holm", "none"], state="readonly", width=10).grid(row=3, column=3, sticky="w", pady=(8, 0))
+        # Quick add: pick an algo and append it to the CSV list.
+        ttk.Label(self.sim_frame, text="Add algo:").grid(row=3, column=2, sticky="w", padx=(14, 0), pady=(8, 0))
+        self._algo_add_cb = ttk.Combobox(
+            self.sim_frame,
+            textvariable=self._algo_add_var,
+            values=self._known_algos_for_picker(),
+            state="readonly",
+            width=18,
+        )
+        self._algo_add_cb.grid(row=3, column=3, sticky="w", pady=(8, 0))
+
+        def _on_add_algo() -> None:
+            self._add_algo_to_csv_var(self.algos_var, self._algo_add_var.get())
+
+        ttk.Button(self.sim_frame, text="Add", command=_on_add_algo).grid(row=3, column=4, sticky="w", padx=(8, 0), pady=(8, 0))
+
+        ttk.Label(self.sim_frame, text="Reference (Wilcoxon):").grid(row=4, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(self.sim_frame, textvariable=self.baseline_algo_var, width=12).grid(row=4, column=1, sticky="w", pady=(8, 0))
+
+        ttk.Label(self.sim_frame, text="Correction:").grid(row=4, column=2, sticky="w", padx=(14, 0), pady=(8, 0))
+        ttk.Combobox(self.sim_frame, textvariable=self.correction_var, values=["holm", "none"], state="readonly", width=10).grid(row=4, column=3, sticky="w", pady=(8, 0))
 
         self.sim_frame.columnconfigure(1, weight=1)
 
     def _build_excel_frame(self) -> None:
-        ttk.Label(self.excel_frame, text="Préfixe détecté (*_ALL_summary.csv):").grid(row=0, column=0, sticky="w")
+        ttk.Label(self.excel_frame, text="Detected prefix (*_ALL_summary.csv):").grid(row=0, column=0, sticky="w")
         self.excel_prefix_cb = ttk.Combobox(self.excel_frame, textvariable=self.excel_prefix_var, values=[], state="readonly", width=45)
         self.excel_prefix_cb.grid(row=0, column=1, sticky="w")
 
-        ttk.Button(self.excel_frame, text="Utiliser ce préfixe", command=self._set_excel_from_prefix).grid(row=0, column=2, padx=(8, 0))
+        ttk.Button(self.excel_frame, text="Use this prefix", command=self._set_excel_from_prefix).grid(row=0, column=2, padx=(8, 0))
 
-        ttk.Label(self.excel_frame, text="Fichier Excel:").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(self.excel_frame, text="Excel file:").grid(row=1, column=0, sticky="w", pady=(8, 0))
         ttk.Entry(self.excel_frame, textvariable=self.excel_file_var, width=60).grid(row=1, column=1, sticky="we", pady=(8, 0))
-        ttk.Button(self.excel_frame, text="Choisir...", command=self._choose_excel_out).grid(row=1, column=2, padx=(8, 0), pady=(8, 0))
+        ttk.Button(self.excel_frame, text="Choose...", command=self._choose_excel_out).grid(row=1, column=2, padx=(8, 0), pady=(8, 0))
 
         ttk.Label(self.excel_frame, text="Correction:").grid(row=2, column=0, sticky="w", pady=(8, 0))
         ttk.Combobox(self.excel_frame, textvariable=self.correction_var, values=["holm", "none"], state="readonly", width=10).grid(row=2, column=1, sticky="w", pady=(8, 0))
@@ -419,13 +914,13 @@ class RunnerApp:
         self.excel_frame.columnconfigure(1, weight=1)
 
     def _build_plots_frame(self) -> None:
-        ttk.Label(self.plots_frame, text="Métriques:").grid(row=0, column=0, sticky="w")
+        ttk.Label(self.plots_frame, text="Metrics:").grid(row=0, column=0, sticky="w")
 
         metric_mode = ttk.Frame(self.plots_frame)
         metric_mode.grid(row=0, column=1, sticky="w")
-        ttk.Radiobutton(metric_mode, text="Une métrique", value="one", variable=self.metric_mode_var, command=self._refresh_metric_state).pack(side="left")
-        ttk.Radiobutton(metric_mode, text="Toutes", value="all", variable=self.metric_mode_var, command=self._refresh_metric_state).pack(side="left", padx=(12, 0))
-        ttk.Radiobutton(metric_mode, text="Sélection", value="select", variable=self.metric_mode_var, command=self._refresh_metric_state).pack(side="left", padx=(12, 0))
+        ttk.Radiobutton(metric_mode, text="One metric", value="one", variable=self.metric_mode_var, command=self._refresh_metric_state).pack(side="left")
+        ttk.Radiobutton(metric_mode, text="All", value="all", variable=self.metric_mode_var, command=self._refresh_metric_state).pack(side="left", padx=(12, 0))
+        ttk.Radiobutton(metric_mode, text="Select", value="select", variable=self.metric_mode_var, command=self._refresh_metric_state).pack(side="left", padx=(12, 0))
 
         # Scrollable radio list so Tkinter never "hides" items.
         metric_box = ttk.Frame(self.plots_frame)
@@ -464,25 +959,25 @@ class RunnerApp:
             ("Hist", self.plot_hist),
             ("Heatmap", self.plot_heatmap),
         ]
-        # 2 lignes × 3 colonnes pour éviter que le menu soit caché.
+        # 2 rows × 3 columns to avoid clipping.
         for i, (label, var) in enumerate(items):
             r = i // 3
             c = i % 3
             ttk.Checkbutton(checks, text=label, variable=var).grid(row=r, column=c, sticky="w", padx=(0 if c == 0 else 14, 0), pady=(0 if r == 0 else 4, 0))
 
-        ttk.Label(self.plots_frame, text="Excel existant:").grid(row=3, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(self.plots_frame, text="Existing Excel:").grid(row=3, column=0, sticky="w", pady=(8, 0))
         self.excel_exist_cb = ttk.Combobox(self.plots_frame, values=[], state="readonly", width=60)
         self.excel_exist_cb.grid(row=3, column=1, columnspan=2, sticky="we", pady=(8, 0))
-        ttk.Button(self.plots_frame, text="Choisir...", command=self._choose_excel_in).grid(row=3, column=3, padx=(8, 0), pady=(8, 0))
+        ttk.Button(self.plots_frame, text="Choose...", command=self._choose_excel_in).grid(row=3, column=3, padx=(8, 0), pady=(8, 0))
 
         # Multi-Excel scenario comparison
-        ttk.Label(self.plots_frame, text="Comparer scénarios (multi-Excel):").grid(row=4, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(self.plots_frame, text="Compare scenarios (multi-Excel):").grid(row=4, column=0, sticky="w", pady=(8, 0))
         ttk.Entry(self.plots_frame, textvariable=self.compare_excels_var, state="readonly", width=60).grid(
             row=4, column=1, columnspan=2, sticky="we", pady=(8, 0)
         )
-        ttk.Button(self.plots_frame, text="Choisir...", command=self._choose_excels_multi).grid(row=4, column=3, padx=(8, 0), pady=(8, 0))
+        ttk.Button(self.plots_frame, text="Choose...", command=self._choose_excels_multi).grid(row=4, column=3, padx=(8, 0), pady=(8, 0))
 
-        ttk.Label(self.plots_frame, text="Algorithmes (scénarios):").grid(row=5, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(self.plots_frame, text="Algorithms (scenarios):").grid(row=5, column=0, sticky="w", pady=(8, 0))
         ttk.Entry(self.plots_frame, textvariable=self.compare_algos_var, width=60).grid(row=5, column=1, columnspan=3, sticky="we", pady=(8, 0))
 
         ttk.Label(self.plots_frame, textvariable=self.compare_algos_help_var).grid(
@@ -515,7 +1010,7 @@ class RunnerApp:
         disp = "; ".join(names)
         if len(disp) > 160:
             disp = disp[:157] + "..."
-        self.compare_excels_var.set(f"{len(names)} fichier(s): {disp}")
+        self.compare_excels_var.set(f"{len(names)} file(s): {disp}")
 
     def _rebuild_metric_widgets(self) -> None:
         prev_metric = (self.metric_var.get() or "").strip()
@@ -766,18 +1261,80 @@ class RunnerApp:
         self.log_text.see("end")
 
     def _tick_ui(self) -> None:
-        try:
-            while True:
+        # Coalesce logs to reduce refresh overhead and avoid UI churn.
+        max_lines = 500
+        buf: List[str] = []
+        for _ in range(max_lines):
+            try:
                 line = self._log_queue.get_nowait()
-                self._append_log(line)
-        except queue.Empty:
+            except queue.Empty:
+                break
+            buf.append(line if line.endswith("\n") else (line + "\n"))
+
+        if buf:
+            try:
+                self.log_text.insert("end", "".join(buf))
+                self.log_text.see("end")
+            except Exception:
+                for line in buf:
+                    self._append_log(line)
+
+        self.root.after(300, self._tick_ui)
+
+    def _on_close(self) -> None:
+        # Called when user closes the window.
+
+        try:
+            running = False
+            if self._worker is not None and self._worker.is_alive():
+                running = True
+            if self._snapshot_active_procs():
+                running = True
+
+            msg = "Do you want to exit WSN Runner?"
+            if running:
+                msg += "\n\nThere are running processes and they will be stopped."
+
+            if not bool(messagebox.askyesno("Exit", msg)):
+                return
+        except Exception:
+            # If UI prompt fails, proceed with best-effort close.
             pass
 
-        self.root.after(120, self._tick_ui)
+        try:
+            self._stop_event.set()
+            self._kill_all_processes()
+        except Exception:
+            pass
+
+        # If a run session is active, mark it as stopped for resume-on-startup.
+        try:
+            if self._run_session_file is not None:
+                self._session_set({"status": "stopped", "stop_reason": "window_closed"})
+        except Exception:
+            pass
+        try:
+            self._save_settings()
+        except Exception:
+            pass
+        try:
+            self.root.after(50, self.root.destroy)
+        except Exception:
+            try:
+                self.root.destroy()
+            except Exception:
+                pass
 
     def _set_running(self, running: bool) -> None:
         self.start_btn.configure(state=("disabled" if running else "normal"))
         self.stop_btn.configure(state=("normal" if running else "disabled"))
+        self.pause_btn.configure(state=("normal" if running else "disabled"))
+        if not running:
+            self._paused = False
+            try:
+                self.pause_btn.configure(text="Pause")
+            except Exception:
+                pass
 
     def _on_start(self) -> None:
         if self._worker and self._worker.is_alive():
@@ -785,17 +1342,28 @@ class RunnerApp:
 
         workdir = Path(self.workdir_var.get())
         if not workdir.exists():
-            messagebox.showerror("Erreur", f"Dossier introuvable: {workdir}")
+            messagebox.showerror("Error", f"Folder not found: {workdir}")
             return
 
         self._stop_event.clear()
         self.progress_var.set(0.0)
         self.progress_text_var.set("0%")
         self.eta_var.set("ETA: --")
+        self.finish_time_var.set("Fin: --")
 
         self._progress_total_units = 0
         self._progress_done_units = 0
         self._progress_t0 = 0.0
+        with self._progress_lock:
+            self._last_run_algo = ""
+            self._last_run_scenario = ""
+            self._last_run_run = None
+            self._last_run_seed = None
+            self._campaign_algos_count = 0
+            self._campaign_total_seeds = 0
+
+        self._reset_eta_estimator()
+        self._reset_heartbeat()
 
         mode = self.mode_var.get()
         self._worker = threading.Thread(target=self._run_worker, args=(mode,), daemon=True)
@@ -804,17 +1372,157 @@ class RunnerApp:
 
     def _on_stop(self) -> None:
         self._stop_event.set()
+        # Best-effort: kill ALL subprocesses (including parallel jobs).
+        self._kill_all_processes()
+
+    def _register_proc(self, proc: subprocess.Popen) -> None:
+        try:
+            pid = int(proc.pid)
+        except Exception:
+            return
+        with self._procs_lock:
+            self._active_procs[pid] = proc
+
+    def _unregister_proc(self, proc: subprocess.Popen) -> None:
+        try:
+            pid = int(proc.pid)
+        except Exception:
+            return
+        with self._procs_lock:
+            self._active_procs.pop(pid, None)
+
+    def _snapshot_active_procs(self) -> List[subprocess.Popen]:
+        with self._procs_lock:
+            procs = list(self._active_procs.values())
+        # Include current single-proc runner handle as well.
         p = self._proc
-        if p and p.poll() is None:
+        if p is not None and p not in procs:
+            procs.append(p)
+        return procs
+
+    def _kill_one_process(self, proc: subprocess.Popen) -> None:
+        try:
+            if proc.poll() is not None:
+                return
+        except Exception:
+            return
+
+        # On Windows, taskkill reliably kills the whole tree (/T).
+        if os.name == "nt":
             try:
-                p.terminate()
+                subprocess.run(
+                    ["taskkill", "/PID", str(int(proc.pid)), "/T", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+                return
             except Exception:
                 pass
+
+        # Fallback (POSIX or taskkill failed)
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=1.0)
+            return
+        except Exception:
+            pass
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+    def _kill_all_processes(self) -> None:
+        procs = self._snapshot_active_procs()
+        if not procs:
+            return
+
+        self._log_queue.put(f"[runner] Stop: trying to kill {len(procs)} process(es)...\n")
+        for p in procs:
+            self._kill_one_process(p)
+
+    def _set_paused(self, paused: bool) -> None:
+        if paused == self._paused:
+            return
+
+        if psutil is None:
+            messagebox.showerror("Pause", "Pause requires psutil (pip install psutil).")
+            return
+
+        procs = self._snapshot_active_procs()
+        if not procs:
+            self._paused = False
+            try:
+                self.pause_btn.configure(text="Pause")
+            except Exception:
+                pass
+            return
+
+        def iter_tree(pr):
+            # Include children (recursive) + the root process.
+            try:
+                kids = pr.children(recursive=True)
+            except Exception:
+                kids = []
+            return list(kids) + [pr]
+
+        # Apply to the whole tree: on Windows the Popen PID can be a shell wrapper (cmd/powershell)
+        # and the real python worker is its child.
+        acted = 0
+        seen_pids: set[int] = set()
+        for p in procs:
+            try:
+                root = psutil.Process(int(p.pid))
+            except Exception:
+                continue
+
+            tree = iter_tree(root)
+            # Order matters a bit: suspend children first; resume parent first.
+            if paused:
+                ordered = tree  # children then root
+            else:
+                ordered = list(reversed(tree))  # root then children
+
+            for pr in ordered:
+                try:
+                    pid = int(pr.pid)
+                    if pid in seen_pids:
+                        continue
+                    if paused:
+                        pr.suspend()
+                    else:
+                        pr.resume()
+                    seen_pids.add(pid)
+                    acted += 1
+                except Exception:
+                    continue
+
+        self._paused = bool(paused)
+        if self._paused:
+            self._log_queue.put(f"[runner] Pause: {acted} process(es) suspended.\n")
+            try:
+                self.pause_btn.configure(text="Resume")
+            except Exception:
+                pass
+        else:
+            self._log_queue.put(f"[runner] Resume: {acted} process(es) resumed.\n")
+            try:
+                self.pause_btn.configure(text="Pause")
+            except Exception:
+                pass
+
+    def _on_pause(self) -> None:
+        # Toggle pause/resume
+        self._set_paused(not bool(self._paused))
 
     def _run_worker(self, mode: str) -> None:
         t0 = time.perf_counter()
         try:
-            self._log_queue.put(f"[time] {_system_time_str()} - Début opération: mode={mode}.\n")
+            if bool(self.verbose_logs_var.get()):
+                self._log_queue.put(f"[time] {_system_time_str()} - Operation started: mode={mode}.\n")
             if mode == "simulate":
                 self._run_simulate_pipeline()
             elif mode == "excel":
@@ -824,17 +1532,35 @@ class RunnerApp:
             else:
                 raise ValueError(f"Unknown mode: {mode}")
 
-            self._log_queue.put(f"[time] {_system_time_str()} - Fin opération: mode={mode}.\n")
-            self._log_queue.put("[runner] Terminé.\n")
+            if bool(self.verbose_logs_var.get()):
+                self._log_queue.put(f"[time] {_system_time_str()} - Operation finished: mode={mode}.\n")
+            self._log_queue.put("[runner] Done.\n")
         except Exception as e:
-            self._log_queue.put(f"[runner] ERREUR: {e}\n")
-            messagebox.showerror("Erreur", str(e))
-            self._log_queue.put(f"[time] {_system_time_str()} - Fin opération (avec erreur): mode={mode}.\n")
+            stop_like = bool(self._stop_event.is_set()) or (str(e).strip().lower() == "stop requested")
+
+            # Persist session status for resume-on-startup.
+            try:
+                if mode == "simulate" and self._run_session_file is not None:
+                    if stop_like:
+                        self._session_set({"status": "stopped"})
+                    else:
+                        self._session_set({"status": "error", "error": str(e)})
+            except Exception:
+                pass
+
+            if stop_like:
+                self._log_queue.put("[runner] Stopped.\n")
+            else:
+                self._log_queue.put(f"[runner] ERROR: {e}\n")
+                # Tkinter UI calls must run on the main thread.
+                self._ui_show_error("Error", str(e))
+            if bool(self.verbose_logs_var.get()):
+                self._log_queue.put(f"[time] {_system_time_str()} - Operation finished (error): mode={mode}.\n")
         finally:
             _ = time.perf_counter() - t0
             self.root.after(0, lambda: self._set_running(False))
 
-    def _set_progress_ui(self, pct: float, eta_s: Optional[int]) -> None:
+    def _set_progress_ui(self, pct: float, eta_s: Optional[int], *, finish_dt: Optional[datetime] = None) -> None:
         pct = max(0.0, min(100.0, float(pct)))
 
         def apply() -> None:
@@ -842,39 +1568,205 @@ class RunnerApp:
             self.progress_text_var.set(f"{pct:.1f}%")
             if eta_s is None:
                 self.eta_var.set("ETA: --")
+                self.finish_time_var.set("Fin: --")
             else:
-                self.eta_var.set(f"ETA: {eta_s//60:02d}:{eta_s%60:02d}")
+                self.eta_var.set(f"ETA: {self._format_eta_s(eta_s)}")
+                try:
+                    end_dt = finish_dt if finish_dt is not None else (datetime.now() + timedelta(seconds=int(eta_s)))
+                    self.finish_time_var.set("Fin: " + end_dt.strftime("%Y-%m-%d %H:%M:%S"))
+                except Exception:
+                    self.finish_time_var.set("Fin: --")
 
         self.root.after(0, apply)
+
+    def _reset_eta_estimator(self) -> None:
+        """Reset internal ETA smoothing state."""
+
+        now = time.perf_counter()
+        with self._progress_lock:
+            self._eta_last_t = float(now)
+            self._eta_last_done = int(self._progress_done_units)
+            self._eta_rate_ema = 0.0
+
+    def _reset_heartbeat(self) -> None:
+        now = time.perf_counter()
+        with self._progress_lock:
+            self._hb_last_t = float(now)
+
+    @staticmethod
+    def _format_eta_s(eta_s: Optional[int]) -> str:
+        if eta_s is None or int(eta_s) < 0:
+            return "--"
+
+        s = int(eta_s)
+        days = s // 86400
+        s = s % 86400
+        hours = s // 3600
+        s = s % 3600
+        mins = s // 60
+        secs = s % 60
+
+        if days > 0:
+            return f"{days}d {hours:02d}:{mins:02d}:{secs:02d}"
+        if hours > 0:
+            return f"{hours:02d}:{mins:02d}:{secs:02d}"
+        return f"{mins:02d}:{secs:02d}"
+
+    def _estimate_eta_seconds(self, *, now: float, done: int, total: int, t0: float, rate_ema: float) -> Optional[int]:
+        remain = max(0, int(total) - int(done))
+        if remain <= 0:
+            return 0
+
+        # Prefer smoothed rate once we have signal.
+        if done >= 2 and t0 > 0.0 and rate_ema > 1e-9:
+            return int(float(remain) / float(rate_ema))
+
+        # Fallback: global average.
+        # Use done>=1 so ETA shows up after the first completed run (user expectation).
+        if done >= 1 and t0 > 0.0:
+            elapsed = max(0.001, float(now) - float(t0))
+            rate = float(done) / elapsed
+            if rate > 1e-9:
+                return int(float(remain) / rate)
+
+        return None
+
+    def _maybe_log_heartbeat(self, *, active_jobs: Optional[int] = None, total_jobs: Optional[int] = None) -> None:
+        """Emit periodic mini logs for long-running operations."""
+
+        now = time.perf_counter()
+        with self._progress_lock:
+            last = float(self._hb_last_t)
+            if self._hb_interval_s <= 0.0:
+                return
+            if last > 0.0 and (now - last) < float(self._hb_interval_s):
+                return
+            self._hb_last_t = float(now)
+
+            done = int(self._progress_done_units)
+            total = int(self._progress_total_units)
+            t0 = float(self._progress_t0)
+            rate_ema = float(self._eta_rate_ema)
+            last_algo = str(self._last_run_algo or "").strip()
+            last_sc = str(self._last_run_scenario or "").strip()
+            last_run = self._last_run_run
+            last_seed = self._last_run_seed
+
+            algos_count = int(self._campaign_algos_count)
+            total_seeds = int(self._campaign_total_seeds)
+
+        if total <= 0:
+            return
+
+        eta_s = self._estimate_eta_seconds(now=now, done=done, total=total, t0=t0, rate_ema=rate_ema)
+        pct = 100.0 * float(done) / float(total)
+
+        rate_txt = "--" if rate_ema <= 1e-9 else f"{rate_ema:.2f} u/s"
+        jobs_txt = ""
+        if active_jobs is not None and total_jobs is not None:
+            jobs_txt = f" | jobs actifs: {int(active_jobs)}/{int(total_jobs)}"
+
+        seeds_txt = ""
+        if algos_count > 0 and total_seeds > 0:
+            seeds_done = int(done) // int(algos_count)
+            seeds_txt = f" | seeds~={seeds_done}/{total_seeds}"
+
+        last_txt = ""
+        if last_sc or last_algo or (last_run is not None) or (last_seed is not None):
+            parts: List[str] = []
+            if last_sc:
+                parts.append(last_sc)
+            if last_algo:
+                parts.append(last_algo)
+            if last_run is not None:
+                parts.append(f"run={int(last_run)}")
+            if last_seed is not None:
+                parts.append(f"seed={int(last_seed)}")
+            last_txt = " | last: " + " ".join(parts)
+
+        self._log_queue.put(
+            f"[hb] {done}/{total} ({pct:.1f}%) | rate={rate_txt} | ETA={self._format_eta_s(eta_s)}{jobs_txt}{seeds_txt}{last_txt}\n"
+        )
+
+    def _set_eta_override(self, eta_s: Optional[int]) -> None:
+        """Set or clear ETA override, keeping a stable finish timestamp."""
+
+        with self._progress_lock:
+            if eta_s is None:
+                self._eta_override_s = None
+                self._eta_override_finish_dt = None
+                return
+
+            v = max(0, int(eta_s))
+            # If the value didn't change, keep the existing finish timestamp.
+            if self._eta_override_s is not None and int(self._eta_override_s) == int(v) and self._eta_override_finish_dt is not None:
+                return
+
+            self._eta_override_s = v
+            try:
+                self._eta_override_finish_dt = datetime.now() + timedelta(seconds=v)
+            except Exception:
+                self._eta_override_finish_dt = None
 
     def _compute_and_push_progress(self) -> None:
         total = int(self._progress_total_units)
         if total <= 0:
             return
 
+        now = time.perf_counter()
         with self._progress_lock:
             done = int(self._progress_done_units)
             t0 = float(self._progress_t0)
 
+            # Update smoothed rate (units/sec)
+            dt = float(now - float(self._eta_last_t))
+            dd = int(done - int(self._eta_last_done))
+            # Important: only update the rate when progress is made.
+            # Otherwise, long gaps between run lines (CPU-heavy runs) would
+            # push the instantaneous rate toward 0 and make ETA *increase*.
+            if dt > 0.0 and dd > 0:
+                inst_rate = float(dd) / dt
+                alpha = 0.25  # higher => more reactive, lower => smoother
+                if self._eta_rate_ema <= 0.0:
+                    self._eta_rate_ema = inst_rate
+                else:
+                    self._eta_rate_ema = (1.0 - alpha) * self._eta_rate_ema + alpha * inst_rate
+
+                self._eta_last_t = float(now)
+                self._eta_last_done = int(done)
+            rate_ema = float(self._eta_rate_ema)
+
         pct = 100.0 * float(done) / float(total)
 
-        eta_s: Optional[int] = None
-        if done > 0 and t0 > 0:
-            elapsed = max(0.001, time.time() - t0)
-            rate = done / elapsed
-            remain = max(0, total - done)
-            eta_s = int(remain / max(1e-9, rate))
+        # Prefer explicit override if provided (e.g., job-duration-based ETA).
+        with self._progress_lock:
+            override = self._eta_override_s
+            override_finish = self._eta_override_finish_dt
+        if override is not None and int(override) >= 0:
+            # Keep a stable end-time display and let the remaining seconds tick down.
+            if override_finish is not None:
+                try:
+                    rem = int((override_finish - datetime.now()).total_seconds())
+                except Exception:
+                    rem = int(override)
+                self._set_progress_ui(pct, max(0, rem), finish_dt=override_finish)
+            else:
+                self._set_progress_ui(pct, int(override))
+            return
 
+        eta_s = self._estimate_eta_seconds(now=now, done=done, total=total, t0=t0, rate_ema=rate_ema)
         self._set_progress_ui(pct, eta_s)
 
     def _run_cmd_with_progress(self, argv: List[str], count_run_lines: bool = False) -> int:
         shell_kind = self.shell_var.get()
         workdir = Path(self.workdir_var.get())
 
-        self._log_queue.put(f"[time] {_system_time_str()} - Début cmd.\n")
-        self._log_queue.put(f"[cmd] {' '.join(argv)}\n")
+        if bool(self.verbose_logs_var.get()):
+            self._log_queue.put(f"[time] {_system_time_str()} - Command start.\n")
+            self._log_queue.put(f"[cmd] {' '.join(argv)}\n")
         proc = _popen_capture(shell_kind, workdir, argv)
         self._proc = proc
+        self._register_proc(proc)
 
         def bump_and_update() -> None:
             with self._progress_lock:
@@ -888,10 +1780,37 @@ class RunnerApp:
             if self._stop_event.is_set():
                 break
 
-            line = line.rstrip("\n")
-            self._log_queue.put(line)
+            # On Windows, lines are typically CRLF; strip both so regex matches.
+            line = line.rstrip("\r\n")
 
             m = RUN_LINE_RE.match(line)
+            if m:
+                try:
+                    run_idx = int(m.group("run"))
+                    with self._progress_lock:
+                        self._last_run_scenario = str(m.group("scenario")).strip()
+                        self._last_run_algo = str(m.group("algo")).strip()
+                        self._last_run_run = int(run_idx)
+                        # In this mode, base_seed is unknown; leave seed unset.
+                        self._last_run_seed = None
+                except Exception:
+                    pass
+
+            # Log policy:
+            # - Always show per-run lines (most useful)
+            # - Other output only when Detailed logs is enabled
+            if m:
+                try:
+                    sc = str(m.group("scenario")).strip()
+                    algo = str(m.group("algo")).strip()
+                    run_idx = int(m.group("run"))
+                    self._log_queue.put(f"[run] {sc} | {algo} | run={run_idx}\n")
+                except Exception:
+                    self._log_queue.put(line)
+            else:
+                if bool(self.verbose_logs_var.get()):
+                    self._log_queue.put(line)
+
             if m and count_run_lines:
                 # each printed run = one completed unit across all jobs
                 bump_and_update()
@@ -902,114 +1821,384 @@ class RunnerApp:
             except Exception:
                 pass
 
-        rc = proc.wait()
-        self._proc = None
-        self._log_queue.put(f"[time] {_system_time_str()} - Fin cmd (rc={int(rc)}).\n")
+        try:
+            rc = proc.wait()
+        finally:
+            self._unregister_proc(proc)
+            if self._proc is proc:
+                self._proc = None
+        if bool(self.verbose_logs_var.get()):
+            self._log_queue.put(f"[time] {_system_time_str()} - Command end (rc={int(rc)}).\n")
         return int(rc)
 
-    def _run_parallel_jobs(self, jobs: List[Tuple[str, int]], base_argv_builder) -> None:
+    def _run_parallel_jobs(self, jobs: List[Tuple[str, int, int]], base_argv_builder, *, algos: List[str], total_seeds: int) -> None:
         """Run multiple jobs in parallel while aggregating progress from stdout."""
 
         procs: List[Tuple[str, subprocess.Popen]] = []
         threads: List[threading.Thread] = []
+        job_t0: dict[str, float] = {}
+        job_completed: set[str] = set()
+        job_durations: List[float] = []
 
-        def reader(prefix: str, proc: subprocess.Popen) -> None:
+        # ETA calibration logic (user request):
+        # - Baseline algorithm (default FSS): watch run index progression across parallel jobs
+        # - Each time ALL eligible jobs reach the next baseline run (r -> r+1), recompute dt
+        # - Use the latest (smoothed) dt to estimate remaining wall time, ignoring fast algos
+        baseline_algo = (self.baseline_algo_var.get() or "FSS").strip().upper()
+        fast_algos = set(ETA_FAST_ALGOS)
+        heavy_algos = [a for a in [str(x).strip() for x in algos] if a and a.upper() not in fast_algos]
+        heavy_count = int(len(heavy_algos))
+        heavy_total_units = int(max(0, int(total_seeds)) * max(0, heavy_count))
+
+        eligible_prefixes = {pref for pref, _base_seed, runs_job in jobs if int(runs_job) >= 2}
+        eligible_n = int(len(eligible_prefixes))
+        eta_state_lock = threading.Lock()
+        baseline_seen: dict[int, set[str]] = {}
+        baseline_all_t: dict[int, float] = {}
+        eta_dt_ema: Optional[float] = None
+        eta_done_heavy_units: int = 0
+
+        # Tee each job's stdout to a log file (so we can inspect later if something goes wrong).
+        # Logs are deleted on a fully successful pipeline (user request).
+        logs_root: Optional[Path] = self._job_logs_dir
+        if logs_root is not None:
+            try:
+                logs_root.mkdir(parents=True, exist_ok=True)
+                if bool(self.verbose_logs_var.get()):
+                    self._log_queue.put(f"[runner] Job logs dir: {logs_root}\n")
+            except Exception:
+                logs_root = None
+
+        def reader(prefix: str, base_seed: int, proc: subprocess.Popen) -> None:
             try:
                 if proc.stdout is None:
                     return
 
-                for raw in proc.stdout:
-                    if self._stop_event.is_set():
-                        break
+                log_fh = None
+                if logs_root is not None:
+                    try:
+                        safe_prefix = re.sub(r"[^A-Za-z0-9._-]+", "_", str(prefix))
+                        log_path = Path(logs_root) / f"{safe_prefix}.log"
+                        log_fh = open(log_path, "a", encoding="utf-8", errors="replace")
+                    except Exception:
+                        log_fh = None
 
-                    line = raw.rstrip("\n")
-                    self._log_queue.put(line)
+                try:
+                    for raw in proc.stdout:
+                        if log_fh is not None:
+                            try:
+                                log_fh.write(raw)
+                            except Exception:
+                                pass
 
-                    if RUN_LINE_RE.match(line):
-                        with self._progress_lock:
-                            self._progress_done_units += 1
+                        if self._stop_event.is_set():
+                            break
+
+                        # On Windows, lines are typically CRLF; strip both so regex matches.
+                        line = raw.rstrip("\r\n")
+                        m = RUN_LINE_RE.match(line)
+
+                        if m:
+                            try:
+                                run_idx = int(m.group("run"))
+                                seed = int(base_seed) + int(run_idx)
+                                algo_u = str(m.group("algo")).strip().upper()
+
+                                # Track done units for ETA excluding fast algos.
+                                if heavy_total_units > 0:
+                                    with eta_state_lock:
+                                        if algo_u not in fast_algos:
+                                            eta_done_heavy_units += 1
+
+                                # Calibration markers based on baseline algo.
+                                # Re-evaluate every time all parallel jobs complete the next baseline run.
+                                if eligible_n > 0 and prefix in eligible_prefixes and algo_u == baseline_algo:
+                                    now = time.perf_counter()
+                                    with eta_state_lock:
+                                        s = baseline_seen.get(int(run_idx))
+                                        if s is None:
+                                            s = set()
+                                            baseline_seen[int(run_idx)] = s
+                                        s.add(prefix)
+
+                                        # When all jobs have reached this run_idx, record the timestamp.
+                                        if int(run_idx) not in baseline_all_t and len(s) >= eligible_n:
+                                            baseline_all_t[int(run_idx)] = float(now)
+
+                                            prev = int(run_idx) - 1
+                                            if prev in baseline_all_t:
+                                                dt = max(0.001, float(now) - float(baseline_all_t[prev]))
+                                                alpha = 0.35  # smoothing factor for dt updates
+                                                if eta_dt_ema is None:
+                                                    eta_dt_ema = float(dt)
+                                                else:
+                                                    eta_dt_ema = (1.0 - alpha) * float(eta_dt_ema) + alpha * float(dt)
+
+                                                self._log_queue.put(
+                                                    f"[eta] Recalibrated: baseline={baseline_algo}, step={prev}->{int(run_idx)}, dt={dt:.2f}s, ema={float(eta_dt_ema):.2f}s over {eligible_n} job(s).\n"
+                                                )
+
+                                with self._progress_lock:
+                                    self._last_run_scenario = str(m.group("scenario")).strip()
+                                    self._last_run_algo = str(m.group("algo")).strip()
+                                    self._last_run_run = int(run_idx)
+                                    self._last_run_seed = int(seed)
+
+                                # Progress: each printed run = one completed unit across all jobs
+                                with self._progress_lock:
+                                    self._progress_done_units += 1
+                            except Exception:
+                                pass
+
+                        # Log policy:
+                        # - Always show per-run lines with seed
+                        # - Other output only when Detailed logs is enabled
+                        if m:
+                            try:
+                                sc = str(m.group("scenario")).strip()
+                                algo = str(m.group("algo")).strip()
+                                run_idx = int(m.group("run"))
+                                seed = int(base_seed) + int(run_idx)
+                                self._log_queue.put(f"[run] {sc} | {algo} | run={run_idx} | seed={seed}\n")
+                            except Exception:
+                                self._log_queue.put(line)
+                        else:
+                            if bool(self.verbose_logs_var.get()):
+                                self._log_queue.put(line)
+
+                finally:
+                    if log_fh is not None:
+                        try:
+                            log_fh.flush()
+                        except Exception:
+                            pass
+                        try:
+                            log_fh.close()
+                        except Exception:
+                            pass
 
             except Exception as e:
                 self._log_queue.put(f"[runner] reader error for {prefix}: {e}\n")
 
-        # start all processes
-        for prefix, base_seed in jobs:
-            if self._stop_event.is_set():
-                raise RuntimeError("Arrêt demandé")
+        try:
+            # start all processes
+            for prefix, base_seed, runs_job in jobs:
+                if self._stop_event.is_set():
+                    raise RuntimeError("Stop requested")
 
-            argv = base_argv_builder(prefix, base_seed)
-            self._log_queue.put(f"[time] {_system_time_str()} - Début job: {prefix} (base_seed={base_seed}).\n")
-            self._log_queue.put(f"[runner] Start job: {prefix} (base_seed={base_seed})\n")
-            proc = _popen_capture(self.shell_var.get(), Path(self.workdir_var.get()), argv)
-            procs.append((prefix, proc))
-            t = threading.Thread(target=reader, args=(prefix, proc), daemon=True)
-            threads.append(t)
-            t.start()
+                argv = base_argv_builder(prefix, base_seed, runs_job)
+                if bool(self.verbose_logs_var.get()):
+                    self._log_queue.put(
+                        f"[time] {_system_time_str()} - Job start: {prefix} (base_seed={base_seed}, runs={runs_job}).\n"
+                    )
+                proc = _popen_capture(self.shell_var.get(), Path(self.workdir_var.get()), argv)
+                self._register_proc(proc)
+                procs.append((prefix, proc))
+                job_t0[prefix] = time.perf_counter()
+                t = threading.Thread(target=reader, args=(prefix, int(base_seed), proc), daemon=True)
+                threads.append(t)
+                t.start()
 
-        # monitor until all finished
-        while True:
-            if self._stop_event.is_set():
-                for _pref, p in procs:
+            # monitor until all finished
+            last_dt_step_used: Optional[float] = None
+            last_active_jobs_used: int = -1
+            last_completed_jobs_count: int = 0
+            while True:
+                if self._stop_event.is_set():
+                    for _pref, p in procs:
+                        self._kill_one_process(p)
+                    raise RuntimeError("Stop requested")
+
+                # Job-duration ETA override (wait for at least one finished job)
+                now = time.perf_counter()
+                for pref, p in procs:
                     if p.poll() is None:
-                        try:
-                            p.terminate()
-                        except Exception:
-                            pass
-                raise RuntimeError("Arrêt demandé")
+                        continue
+                    if pref in job_completed:
+                        continue
+                    st = job_t0.get(pref)
+                    if st is None:
+                        continue
+                    job_completed.add(pref)
+                    job_durations.append(max(0.0, float(now - float(st))))
 
-            self._compute_and_push_progress()
+                completed_jobs_count = int(len(job_completed))
 
-            alive = [p for _pref, p in procs if p.poll() is None]
-            if not alive:
-                break
+                # ETA override: prefer calibration-based estimate once available.
+                active = [p for _pref, p in procs if p.poll() is None]
+                active_jobs = int(max(1, len(active)))
+                with eta_state_lock:
+                    dt_step = eta_dt_ema
+                    done_heavy = int(eta_done_heavy_units)
 
-            time.sleep(0.25)
+                if dt_step is not None and heavy_total_units > 0 and heavy_count > 0:
+                    # Update override only when the calibration step time changes materially
+                    # (i.e., after a new baseline step is completed), or when active
+                    # parallelism changes.
+                    need_update = False
+                    if last_dt_step_used is None:
+                        need_update = True
+                    elif abs(float(dt_step) - float(last_dt_step_used)) / max(1e-9, float(last_dt_step_used)) >= 0.05:
+                        need_update = True
+                    if int(active_jobs) != int(last_active_jobs_used):
+                        need_update = True
 
-        # join readers quickly
-        for t in threads:
-            t.join(timeout=0.5)
+                    if need_update:
+                        remain_heavy = max(0, int(heavy_total_units) - int(done_heavy))
+                        # dt_step approximates wall time for a baseline seed-step across jobs;
+                        # distribute across heavy algos.
+                        per_unit_s = float(dt_step) / float(max(1, heavy_count))
+                        eta_s = int((float(remain_heavy) / float(active_jobs)) * per_unit_s)
+                        self._set_eta_override(max(0, int(eta_s)))
+                        last_dt_step_used = float(dt_step)
+                        last_active_jobs_used = int(active_jobs)
+                else:
+                    # Fallback: job-duration-based ETA once we have at least one finished job.
+                    if job_durations:
+                        # Only update when another job completes (signal changes).
+                        if completed_jobs_count != int(last_completed_jobs_count):
+                            avg_dur = float(sum(job_durations) / max(1, len(job_durations)))
+                            rem_est = 0.0
+                            for pref, p in procs:
+                                if p.poll() is not None:
+                                    continue
+                                st = job_t0.get(pref, now)
+                                rem_est = max(rem_est, max(0.0, avg_dur - float(now - float(st))))
+                            self._set_eta_override(int(rem_est))
+                            last_completed_jobs_count = int(completed_jobs_count)
+                    else:
+                        self._set_eta_override(None)
 
-        # check return codes
-        bad: List[Tuple[str, int]] = []
-        for pref, p in procs:
-            rc = int(p.poll() if p.poll() is not None else p.wait())
-            self._log_queue.put(f"[time] {_system_time_str()} - Fin job: {pref} (rc={rc}).\n")
-            if rc != 0:
-                bad.append((pref, rc))
+                self._compute_and_push_progress()
 
-        if bad:
-            msg = "; ".join(f"{pref}: rc={rc}" for pref, rc in bad)
-            raise RuntimeError(f"Simulation échouée pour: {msg}")
+                self._maybe_log_heartbeat(active_jobs=len(active), total_jobs=len(procs))
+
+                if not active:
+                    break
+
+                time.sleep(0.25)
+
+            # join readers quickly
+            for t in threads:
+                t.join(timeout=0.5)
+
+            # check return codes
+            bad: List[Tuple[str, int]] = []
+            for pref, p in procs:
+                rc = int(p.poll() if p.poll() is not None else p.wait())
+                if bool(self.verbose_logs_var.get()):
+                    self._log_queue.put(f"[time] {_system_time_str()} - Job end: {pref} (rc={rc}).\n")
+                if rc != 0:
+                    bad.append((pref, rc))
+
+            if bad:
+                msg = "; ".join(f"{pref}: rc={rc}" for pref, rc in bad)
+                raise RuntimeError(f"Simulation failed for: {msg}")
+        finally:
+            for _pref, p in procs:
+                try:
+                    self._unregister_proc(p)
+                except Exception:
+                    pass
+            self._set_eta_override(None)
 
     def _run_simulate_pipeline(self) -> None:
+        # If resuming, reuse the previous session dir.
+        resume_dir = self._resume_session_dir
+        self._resume_session_dir = None
+
         scenario_tag = self.scenario_var.get()
         bs = self.bs_var.get()
 
-        runs = RUNS_FIXED
+        try:
+            total_seeds = int(str(self.seeds_total_var.get()).strip())
+        except Exception:
+            raise ValueError("Total seeds must be an integer")
+        if total_seeds <= 0:
+            raise ValueError("Total seeds must be > 0")
+
+        try:
+            parallel_jobs = int(str(self.parallel_jobs_var.get()).strip())
+        except Exception:
+            raise ValueError("Parallel jobs must be an integer")
+        if parallel_jobs <= 0:
+            raise ValueError("Parallel jobs must be > 0")
         rounds = int(self.rounds_var.get())
         if rounds < 200 or rounds > 5000:
-            raise ValueError("Rounds doit être entre 200 et 5000")
+            raise ValueError("Rounds must be between 200 and 5000")
 
         algos = [a.strip() for a in self.algos_var.get().split(",") if a.strip()]
         if not algos:
-            raise ValueError("Liste d'algorithmes vide")
+            raise ValueError("Empty algorithms list")
+
+        # Create (or load) a persisted run session for resume-on-startup.
+        workdir = Path(self.workdir_var.get())
+        if resume_dir is None:
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            session_dir = workdir / RUNS_DIR_NAME / stamp
+            session_file = session_dir / RUN_SESSION_FILE
+            self._run_session_dir = session_dir
+            self._run_session_file = session_file
+            manifest: Dict[str, Any] = {
+                "version": 1,
+                "session_id": stamp,
+                "mode": "simulate",
+                "status": "running",
+                "started_at": _system_time_str(),
+                "updated_at": _system_time_str(),
+                "params": {
+                    "workdir": str(workdir),
+                    "scenario": str(scenario_tag),
+                    "bs": str(bs),
+                    "seeds_total": int(total_seeds),
+                    "parallel_jobs": int(parallel_jobs),
+                    "rounds": int(rounds),
+                    "algos": ",".join(algos),
+                    "baseline_algo": str(self.baseline_algo_var.get().strip() or "FSS"),
+                    "correction": str(self.correction_var.get().strip() or "holm"),
+                },
+                "steps": {"simulate": "pending", "merge": "pending", "excel": "pending", "plots": "pending"},
+                "artifacts": {},
+            }
+            try:
+                _write_json_atomic(session_file, manifest)
+            except Exception:
+                pass
+        else:
+            session_dir = Path(resume_dir)
+            session_file = session_dir / RUN_SESSION_FILE
+            self._run_session_dir = session_dir
+            self._run_session_file = session_file
+            self._session_set({"status": "running"})
 
         scenario_flag = "--only_s1_100" if scenario_tag == "S1_100" else "--only_s2_100"
         prefix_base = _campaign_prefix_base(scenario_tag, bs, rounds)
-        jobs = _make_jobs(prefix_base)
+        jobs = _make_jobs(prefix_base, total_seeds=total_seeds, parallel_jobs=parallel_jobs)
+        if not jobs:
+            raise ValueError("No jobs to run (check seeds/jobs)")
 
-        total_units = len(jobs) * runs * len(algos)
+        self._session_set({"artifacts": {"prefix_base": str(prefix_base)}})
+
+        # Each printed run line corresponds to one (seed, algo) unit.
+        total_units = int(total_seeds) * len(algos)
 
         self._progress_total_units = int(total_units)
         with self._progress_lock:
             self._progress_done_units = 0
-            self._progress_t0 = time.time()
+            self._progress_t0 = time.perf_counter()
+            self._campaign_algos_count = int(len(algos))
+            self._campaign_total_seeds = int(total_seeds)
 
-        self._log_queue.put(f"[runner] Simulation: {scenario_tag}, bs={bs}, runs={runs}, rounds={rounds}, algos={len(algos)}\n")
-        self._log_queue.put(f"[runner] Total unités (scenario×algo×run): {total_units}\n")
-        self._log_queue.put(f"[time] {_system_time_str()} - Début étape: Simulation.\n")
+        self._reset_eta_estimator()
 
-        def build_job_argv(prefix: str, base_seed: int) -> List[str]:
+        self._log_queue.put(
+            f"[runner] Simulation: {scenario_tag}, bs={bs}, total_seeds={total_seeds}, jobs={len(jobs)}, rounds={rounds}, algos={len(algos)}\n"
+        )
+        if bool(self.verbose_logs_var.get()):
+            self._log_queue.put(f"[runner] Total units (seed×algo): {total_units}\n")
+            self._log_queue.put(f"[time] {_system_time_str()} - Step start: Simulation.\n")
+
+        def build_job_argv(prefix: str, base_seed: int, runs_job: int) -> List[str]:
             return [
                 sys.executable,
                 "-u",
@@ -1018,7 +2207,7 @@ class RunnerApp:
                 "--prefix",
                 prefix,
                 "--runs",
-                str(runs),
+                str(int(runs_job)),
                 "--max_rounds",
                 str(rounds),
                 "--base_seed",
@@ -1030,89 +2219,184 @@ class RunnerApp:
                 ",".join(algos),
             ]
 
-        # Run the 6 jobs in parallel (equivalent to Start-Process loop).
-        self._run_parallel_jobs(jobs, build_job_argv)
+        # Decide which steps to run (resume-aware).
+        manifest = _read_json(self._run_session_file) if self._run_session_file is not None else None
+        steps = manifest.get("steps") if isinstance(manifest, dict) else None
+        if not isinstance(steps, dict):
+            steps = {}
 
-        self._log_queue.put(f"[time] {_system_time_str()} - Fin étape: Simulation.\n")
+        # Simulation
+        simulate_done = str(steps.get("simulate") or "") == "done"
+        if not simulate_done:
+            self._session_set_step("simulate", "running")
+            # Organize per-job logs under the session dir.
+            try:
+                if self._run_session_dir is not None:
+                    self._job_logs_dir = Path(self._run_session_dir) / "job_logs"
+            except Exception:
+                self._job_logs_dir = None
+
+            # Run jobs in parallel.
+            self._run_parallel_jobs(jobs, build_job_argv, algos=algos, total_seeds=total_seeds)
+            self._session_set_step("simulate", "done")
+        else:
+            self._log_queue.put("[runner] Resume: Simulation step already done; skipping.\n")
+
+        if bool(self.verbose_logs_var.get()):
+            self._log_queue.put(f"[time] {_system_time_str()} - Step end: Simulation.\n")
 
         # Merge
         if self._stop_event.is_set():
-            raise RuntimeError("Arrêt demandé")
+            self._session_set({"status": "stopped"})
+            raise RuntimeError("Stop requested")
+
+        manifest = _read_json(self._run_session_file) if self._run_session_file is not None else None
+        steps = manifest.get("steps") if isinstance(manifest, dict) else None
+        if not isinstance(steps, dict):
+            steps = {}
+        merge_done = str(steps.get("merge") or "") == "done"
 
         merge_prefix = prefix_base
-        self._log_queue.put(f"[runner] Merge: {merge_prefix}\n")
-        self._log_queue.put(f"[time] {_system_time_str()} - Début étape: Merge.\n")
-
-        merge_argv = [sys.executable, "-u", "-m", "scripts.merge_csvs", "--prefix", merge_prefix, "--out_dir", "."]
-        rc = self._run_cmd_with_progress(merge_argv, count_run_lines=False)
-        if rc != 0:
-            raise RuntimeError("Merge échoué")
-
-        # Verify outputs exist
-        workdir = Path(self.workdir_var.get())
         summary_all = workdir / f"{merge_prefix}_ALL_summary.csv"
         ts_all = workdir / f"{merge_prefix}_ALL_timeseries.csv"
-        if not summary_all.exists() or not ts_all.exists():
-            raise RuntimeError("Merge terminé mais fichiers *_ALL_ manquants")
+        if not merge_done:
+            self._session_set_step("merge", "running")
+            if bool(self.verbose_logs_var.get()):
+                self._log_queue.put(f"[runner] Merge: {merge_prefix}\n")
+                self._log_queue.put(f"[time] {_system_time_str()} - Step start: Merge.\n")
 
-        self._log_queue.put("[runner] Merge OK.\n")
-        self._log_queue.put(f"[time] {_system_time_str()} - Fin étape: Merge.\n")
+            merge_argv = [sys.executable, "-u", "-m", "scripts.merge_csvs", "--prefix", merge_prefix, "--out_dir", "."]
+            rc = self._run_cmd_with_progress(merge_argv, count_run_lines=False)
+            if rc != 0:
+                raise RuntimeError("Merge failed")
+
+            # Verify outputs exist
+            if not summary_all.exists() or not ts_all.exists():
+                raise RuntimeError("Merge finished but *_ALL_* files are missing")
+
+            self._session_set_step("merge", "done")
+            self._session_set(
+                {
+                    "artifacts": {
+                        "prefix_base": str(prefix_base),
+                        "merge_prefix": str(merge_prefix),
+                        "summary_all": str(summary_all),
+                        "timeseries_all": str(ts_all),
+                    }
+                }
+            )
+
+            if bool(self.verbose_logs_var.get()):
+                self._log_queue.put("[runner] Merge OK.\n")
+                self._log_queue.put(f"[time] {_system_time_str()} - Step end: Merge.\n")
+        else:
+            if summary_all.exists() and ts_all.exists():
+                self._log_queue.put("[runner] Resume: Merge step already done; skipping.\n")
+            else:
+                # If outputs are missing, force merge again.
+                self._session_set_step("merge", "pending")
+                raise RuntimeError("Resume: merge was marked done but *_ALL_* files are missing")
 
         # Excel report
         out_xlsx = workdir / f"{merge_prefix}_report.xlsx"
         ref_algo = self.baseline_algo_var.get().strip() or "FSS"
         correction = self.correction_var.get().strip() or "holm"
 
-        self._log_queue.put(f"[runner] Excel: {out_xlsx.name}\n")
-        self._log_queue.put(f"[time] {_system_time_str()} - Début étape: Excel.\n")
-        rep_argv = [
-            sys.executable,
-            "-u",
-            "-m",
-            "scripts.report_excel",
-            "--summary",
-            str(summary_all),
-            "--timeseries",
-            str(ts_all),
-            "--out",
-            str(out_xlsx),
-            "--wilcoxon_mode",
-            "ref_vs_each",
-            "--ref_algo",
-            ref_algo,
-            "--correction",
-            correction,
-        ]
-        rc = self._run_cmd_with_progress(rep_argv, count_run_lines=False)
-        if rc != 0:
-            raise RuntimeError("Génération Excel échouée")
+        manifest = _read_json(self._run_session_file) if self._run_session_file is not None else None
+        steps = manifest.get("steps") if isinstance(manifest, dict) else None
+        if not isinstance(steps, dict):
+            steps = {}
+        excel_done = str(steps.get("excel") or "") == "done"
 
-        if not out_xlsx.exists():
-            raise RuntimeError("Excel non créé")
+        if not excel_done:
+            self._session_set_step("excel", "running")
+            if bool(self.verbose_logs_var.get()):
+                self._log_queue.put(f"[runner] Excel: {out_xlsx.name}\n")
+                self._log_queue.put(f"[time] {_system_time_str()} - Step start: Excel.\n")
+            rep_argv = [
+                sys.executable,
+                "-u",
+                "-m",
+                "scripts.report_excel",
+                "--summary",
+                str(summary_all),
+                "--timeseries",
+                str(ts_all),
+                "--out",
+                str(out_xlsx),
+                "--wilcoxon_mode",
+                "ref_vs_each",
+                "--ref_algo",
+                ref_algo,
+                "--correction",
+                correction,
+            ]
+            rc = self._run_cmd_with_progress(rep_argv, count_run_lines=False)
+            if rc != 0:
+                raise RuntimeError("Excel generation failed")
 
-        self._log_queue.put(f"[time] {_system_time_str()} - Fin étape: Excel.\n")
+            if not out_xlsx.exists():
+                raise RuntimeError("Excel file not created")
+
+            self._session_set_step("excel", "done")
+            self._session_set({"artifacts": {"excel": str(out_xlsx)}})
+
+            if bool(self.verbose_logs_var.get()):
+                self._log_queue.put(f"[time] {_system_time_str()} - Step end: Excel.\n")
+        else:
+            if out_xlsx.exists():
+                self._log_queue.put("[runner] Resume: Excel step already done; skipping.\n")
+            else:
+                self._session_set_step("excel", "pending")
+                raise RuntimeError("Resume: excel was marked done but the .xlsx is missing")
 
         # Optional plots
         plot_types = self._selected_plot_types()
-        if plot_types:
-            self._log_queue.put(f"[runner] Graphiques: {', '.join(plot_types)}\n")
-            self._log_queue.put(f"[time] {_system_time_str()} - Début étape: Graphiques.\n")
-            self._run_plots_for_excel(Path(out_xlsx), workdir, plot_types)
-            self._log_queue.put(f"[time] {_system_time_str()} - Fin étape: Graphiques.\n")
+        manifest = _read_json(self._run_session_file) if self._run_session_file is not None else None
+        steps = manifest.get("steps") if isinstance(manifest, dict) else None
+        if not isinstance(steps, dict):
+            steps = {}
+        plots_done = str(steps.get("plots") or "") == "done"
 
-        self._log_queue.put("[runner] Pipeline complet OK.\n")
+        if plot_types and not plots_done:
+            self._session_set_step("plots", "running")
+            if bool(self.verbose_logs_var.get()):
+                self._log_queue.put(f"[runner] Plots: {', '.join(plot_types)}\n")
+                self._log_queue.put(f"[time] {_system_time_str()} - Step start: Plots.\n")
+            self._run_plots_for_excel(Path(out_xlsx), workdir, plot_types)
+            self._session_set_step("plots", "done")
+            if bool(self.verbose_logs_var.get()):
+                self._log_queue.put(f"[time] {_system_time_str()} - Step end: Plots.\n")
+        elif plot_types and plots_done:
+            self._log_queue.put("[runner] Resume: Plots step already done; skipping.\n")
+
+        self._log_queue.put("[runner] Pipeline complete.\n")
+
+        self._session_set({"status": "complete"})
+
+        # If the pipeline completed successfully, delete job logs (user request).
+        try:
+            if self._job_logs_dir is not None and not self._stop_event.is_set():
+                shutil.rmtree(self._job_logs_dir, ignore_errors=True)
+        except Exception:
+            pass
+        finally:
+            self._job_logs_dir = None
+            self._run_session_dir = None
+            self._run_session_file = None
+
         self.root.after(0, self._refresh_dynamic_lists)
 
     def _run_excel_only(self) -> None:
         workdir = Path(self.workdir_var.get())
         pref = self.excel_prefix_var.get().strip()
         if not pref:
-            raise ValueError("Choisir un préfixe")
+            raise ValueError("Select a prefix")
 
         summary_all = workdir / f"{pref}_ALL_summary.csv"
         ts_all = workdir / f"{pref}_ALL_timeseries.csv"
         if not summary_all.exists() or not ts_all.exists():
-            raise ValueError("Fichiers *_ALL_summary.csv / *_ALL_timeseries.csv introuvables pour ce préfixe")
+            raise ValueError("Missing *_ALL_summary.csv / *_ALL_timeseries.csv for this prefix")
 
         out = self.excel_file_var.get().strip() or str(workdir / f"{pref}_report.xlsx")
         ref_algo = self.baseline_algo_var.get().strip() or "FSS"
@@ -1136,23 +2420,25 @@ class RunnerApp:
             "--correction",
             correction,
         ]
-        self._log_queue.put(f"[time] {_system_time_str()} - Début étape: Excel.\n")
+        if bool(self.verbose_logs_var.get()):
+            self._log_queue.put(f"[time] {_system_time_str()} - Step start: Excel.\n")
         rc = self._run_cmd_with_progress(argv, count_run_lines=False)
         if rc != 0:
-            raise RuntimeError("Génération Excel échouée")
+            raise RuntimeError("Excel generation failed")
 
         self._log_queue.put(f"[runner] Excel OK: {out}\n")
-        self._log_queue.put(f"[time] {_system_time_str()} - Fin étape: Excel.\n")
+        if bool(self.verbose_logs_var.get()):
+            self._log_queue.put(f"[time] {_system_time_str()} - Step end: Excel.\n")
 
     def _run_plots_only(self) -> None:
         # If user selected multiple Excel reports, run scenario comparison instead.
         if self.compare_excels:
             if len(self.compare_excels) < 2:
-                raise ValueError("Comparer scénarios: sélectionnez au moins 2 fichiers Excel")
+                raise ValueError("Compare scenarios: select at least 2 Excel files")
 
             plot_types = self._selected_plot_types()
             if not plot_types:
-                self._log_queue.put("[runner] Aucun graphique sélectionné.\n")
+                self._log_queue.put("[runner] No plot selected.\n")
                 return
 
             mode = (self.metric_mode_var.get() or "one").strip()
@@ -1165,7 +2451,7 @@ class RunnerApp:
                 # Keep UI order from _metric_values
                 metrics_to_run = [m for m in self._metric_values if bool(self._metric_select_vars.get(str(m), tk.BooleanVar(value=False)).get())]
                 if not metrics_to_run:
-                    raise ValueError("Sélection métriques: cochez au moins une métrique")
+                    raise ValueError("Metric selection: pick at least one metric")
             else:
                 # all
                 metrics_to_run = self._common_metrics_for_excels(self.compare_excels)
@@ -1181,9 +2467,9 @@ class RunnerApp:
                     miss_txt = ", ".join(missing)
                     common_txt = self._format_short_list([m for m in self._common_metrics_for_excels(self.compare_excels)])
                     raise ValueError(
-                        "Certaines métriques ne sont pas présentes dans tous les Excel sélectionnés:\n"
+                        "Some metrics are not present in all selected Excel files:\n"
                         f"- Manquantes: {miss_txt}\n\n"
-                        f"Métriques communes disponibles:\n{common_txt}"
+                        f"Common metrics available:\n{common_txt}"
                     )
                 # Filter any non-common metrics (defensive)
                 metrics_to_run = [m for m in metrics_to_run if m in common_metrics]
@@ -1193,24 +2479,28 @@ class RunnerApp:
 
             metrics_disp = self._format_short_list(metrics_to_run, max_items=10)
             self._log_queue.put(
-                f"[runner] Compare scénarios: metrics={metrics_disp}, algos={algos}, plots={','.join(plot_types)}\n"
+                f"[runner] Compare scenarios: metrics={metrics_disp}, algos={algos}, plots={','.join(plot_types)}\n"
             )
 
             # Progress: one command per metric
             with self._progress_lock:
                 self._progress_total_units = max(1, len(metrics_to_run))
                 self._progress_done_units = 0
-                self._progress_t0 = time.time()
+                self._progress_t0 = time.perf_counter()
+
+            self._reset_eta_estimator()
             self._compute_and_push_progress()
 
-            self._log_queue.put(f"[time] {_system_time_str()} - Début étape: Graphiques (comparaison scénarios).\n")
+            if bool(self.verbose_logs_var.get()):
+                self._log_queue.put(f"[time] {_system_time_str()} - Step start: Plots (scenario comparison).\n")
 
             out_dir = str(Path(self.workdir_var.get()))
             for metric in metrics_to_run:
                 if self._stop_event.is_set():
-                    raise RuntimeError("Arrêt demandé")
+                    raise RuntimeError("Stop requested")
 
-                self._log_queue.put(f"[runner] -> métrique: {metric}\n")
+                if bool(self.verbose_logs_var.get()):
+                    self._log_queue.put(f"[runner] -> metric: {metric}\n")
                 argv = [
                     sys.executable,
                     "-u",
@@ -1229,32 +2519,35 @@ class RunnerApp:
                 ]
                 rc = self._run_cmd_with_progress(argv, count_run_lines=False)
                 if rc != 0:
-                    raise RuntimeError(f"Génération graphique scénarios échouée (metric={metric})")
+                    raise RuntimeError(f"Scenario plot generation failed (metric={metric})")
 
                 with self._progress_lock:
                     self._progress_done_units += 1
                 self._compute_and_push_progress()
 
-            self._log_queue.put("[runner] Graphiques comparaison scénarios OK.\n")
-            self._log_queue.put(f"[time] {_system_time_str()} - Fin étape: Graphiques (comparaison scénarios).\n")
+            self._log_queue.put("[runner] Scenario comparison plots OK.\n")
+            if bool(self.verbose_logs_var.get()):
+                self._log_queue.put(f"[time] {_system_time_str()} - Step end: Plots (scenario comparison).\n")
             self.root.after(0, self._refresh_dynamic_lists)
             return
 
         excel_path = self.excel_exist_cb.get().strip()
         if not excel_path:
-            raise ValueError("Choisir un fichier Excel")
+            raise ValueError("Select an Excel file")
 
         plot_types = self._selected_plot_types()
         if not plot_types:
-            self._log_queue.put("[runner] Aucun graphique sélectionné.\n")
+            self._log_queue.put("[runner] No plot selected.\n")
             return
 
         workdir = Path(self.workdir_var.get())
-        self._log_queue.put(f"[time] {_system_time_str()} - Début étape: Graphiques.\n")
+        if bool(self.verbose_logs_var.get()):
+            self._log_queue.put(f"[time] {_system_time_str()} - Step start: Plots.\n")
         self._run_plots_for_excel(Path(excel_path), workdir, plot_types)
 
-        self._log_queue.put("[runner] Graphiques OK.\n")
-        self._log_queue.put(f"[time] {_system_time_str()} - Fin étape: Graphiques.\n")
+        self._log_queue.put("[runner] Plots OK.\n")
+        if bool(self.verbose_logs_var.get()):
+            self._log_queue.put(f"[time] {_system_time_str()} - Step end: Plots.\n")
 
     def _run_plots_for_excel(self, excel: Path, out_dir: Path, plot_types: List[str]) -> None:
         """Run plot_from_excel using the 6 generic plot types requested in the UI."""
@@ -1298,7 +2591,7 @@ class RunnerApp:
             ]
             rc = self._run_cmd_with_progress(argv, count_run_lines=False)
             if rc != 0:
-                raise RuntimeError("Génération graphiques échouée")
+                raise RuntimeError("Plot generation failed")
 
         if not metric_plots:
             self.root.after(0, self._refresh_dynamic_lists)
@@ -1321,7 +2614,7 @@ class RunnerApp:
             elif mode == "select":
                 metrics = [m for m, v in self._metric_select_vars.items() if bool(v.get())]
                 if not metrics:
-                    raise ValueError("Sélection métriques: cochez au moins une métrique")
+                    raise ValueError("Metric selection: pick at least one metric")
             else:
                 metrics = [self.metric_var.get().strip() or "throughput"]
 
@@ -1342,12 +2635,13 @@ class RunnerApp:
                 ]
                 rc = self._run_cmd_with_progress(argv, count_run_lines=False)
                 if rc != 0:
-                    raise RuntimeError("Génération graphiques échouée")
+                    raise RuntimeError("Plot generation failed")
 
         # Line plot: run once for the current metric.
         if line_only:
             if mode in {"all", "select"}:
-                self._log_queue.put("[runner] Note: 'Line' est généré uniquement pour la métrique courante (timeseries).\n")
+                if bool(self.verbose_logs_var.get()):
+                    self._log_queue.put("[runner] Note: 'Line' is generated only for the current metric (timeseries).\n")
 
             line_metric = self.metric_var.get().strip() or "alive"
             argv = [
@@ -1366,7 +2660,7 @@ class RunnerApp:
             ]
             rc = self._run_cmd_with_progress(argv, count_run_lines=False)
             if rc != 0:
-                raise RuntimeError("Génération graphiques échouée")
+                raise RuntimeError("Plot generation failed")
 
         self.root.after(0, self._refresh_dynamic_lists)
 

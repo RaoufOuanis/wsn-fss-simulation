@@ -54,6 +54,14 @@ def _make_fss_params_for_algo(algo_name: str, seed: int) -> FSSParams:
 
     if algo_name == "FSS":
         params.use_phase2 = True
+    elif algo_name == "FSS_legacy":
+        params.use_phase2 = True
+        params.coverage_gain_auto = False
+        params.coverage_gain_weight = 0.0
+    elif algo_name == "FSS_cov":
+        params.use_phase2 = True
+        params.coverage_gain_auto = False
+        params.coverage_gain_weight = 1.0
     elif algo_name == "FSS_noPhase2":
         params.use_phase2 = False
     elif algo_name == "FSS_noEnergy":

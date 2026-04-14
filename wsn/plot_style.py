@@ -42,6 +42,7 @@ ALGO_COLOR_MAP: Dict[str, str] = {
     "FSS_noPhase2": "#bcbd22",
     "FSS_noEnergy": "#e377c2",
     "FSS_noLS": "#9edae5",
+    "FSS_noRepairReg": "#9edae5",
 }
 
 
@@ -231,7 +232,7 @@ def metric_direction(metric: str) -> MetricDirection:
 
 def direction_phrase(metric: str) -> str:
     md = metric_direction(metric)
-    base = "greater is best" if md.direction == "higher" else "lower is better"
+    base = "higher is better" if md.direction == "higher" else "lower is better"
     if md.note:
         base = f"{base} ({md.note})"
     if md.assumed:

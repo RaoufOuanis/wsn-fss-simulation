@@ -170,23 +170,40 @@ def relay_packet_counts(
 
     ch = np.unique(ch)
     k = int(ch.size)
-    # Map global CH index -> local position
-    loc: Dict[int, int] = {int(ch[i]): i for i in range(k)}
 
     q = np.ones(k, dtype=float)
 
-    # Process farthest to nearest (descending kappa); unreachable treated as farthest
-    kappa_safe = np.asarray(kappa, dtype=float)
-    kappa_safe = np.where(np.isfinite(kappa_safe), kappa_safe, np.max(np.where(np.isfinite(kappa_safe), kappa_safe, 0.0)) + 1.0)
-    order = np.argsort(kappa_safe)[::-1]
+    # Convert next_hop (global CH index) -> parent local index in [0..k-1], or -1 for sink/invalid.
+    nh = np.asarray(next_hop, dtype=int).reshape(-1)
+    if nh.size != k:
+        nh = nh[:k] if nh.size > k else np.pad(nh, (0, k - nh.size), constant_values=-1)
 
+    parent_local = np.full(k, -1, dtype=int)
+    mask = nh >= 0
+    if np.any(mask):
+        pos = np.searchsorted(ch, nh[mask])
+        valid = (pos >= 0) & (pos < k) & (ch[pos] == nh[mask])
+        if np.any(valid):
+            idx_mask = np.where(mask)[0]
+            parent_local[idx_mask[valid]] = pos[valid]
+
+    # Process farthest to nearest (descending kappa); unreachable treated as farthest.
+    kappa_safe = np.asarray(kappa, dtype=float).reshape(-1)
+    if kappa_safe.size != k:
+        kappa_safe = kappa_safe[:k] if kappa_safe.size > k else np.pad(kappa_safe, (0, k - kappa_safe.size), constant_values=np.inf)
+
+    finite = np.isfinite(kappa_safe)
+    if np.any(finite):
+        max_finite = float(np.max(kappa_safe[finite]))
+        kappa_safe = np.where(finite, kappa_safe, max_finite + 1.0)
+    else:
+        # All unreachable: any order is fine.
+        kappa_safe = np.zeros(k, dtype=float)
+
+    order = np.argsort(kappa_safe)[::-1]
     for i in order:
-        nh = int(next_hop[i])
-        if nh < 0:
-            continue
-        p = loc.get(nh)
-        if p is None:
-            continue
-        q[p] += q[i]
+        p = int(parent_local[i])
+        if p >= 0:
+            q[p] += q[i]
 
     return q

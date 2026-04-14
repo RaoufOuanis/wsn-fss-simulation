@@ -177,7 +177,7 @@ def plot_means_heatmap(stats: pd.DataFrame, out_dir: Path, prefix: str) -> Path:
     ax.text(
         0.99,
         0.01,
-        "Note: interpretation depends on per-metric direction (greater is best / lower is better)",
+        "Note: interpretation depends on per-metric direction (higher is better / lower is better)",
         transform=ax.transAxes,
         ha="right",
         va="bottom",
@@ -215,7 +215,7 @@ def plot_rank_heatmap(stats: pd.DataFrame, out_dir: Path, prefix: str) -> Path:
     ax.text(
         0.99,
         0.01,
-        "Ranking uses per-metric direction: greater is best / lower is better",
+        "Ranking uses per-metric direction: higher is better / lower is better",
         transform=ax.transAxes,
         ha="right",
         va="bottom",

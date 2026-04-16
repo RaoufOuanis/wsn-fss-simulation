@@ -48,7 +48,7 @@ CLI notes:
 - `wsn/`: simulator core (network model, energy, fitness, repair)
 - `wsn/algorithms/`: optimizers and protocol baselines
   - optimizers: FSS, PSO, GWO, ABC, SO, GJO, EMOGJO, ESOGJO
-  - protocols: LEACH / HEED / SEP / Greedy
+  - protocols: LEACH / HEED / SEP / EEM-LEACH-ABC
 - `wsn/experiments/runner.py`: experiment loop (produces CSV)
 - `scripts/`: CLI tools (merge, Excel report, plots)
 - `runner.py`: Tkinter GUI (end-to-end orchestration)
